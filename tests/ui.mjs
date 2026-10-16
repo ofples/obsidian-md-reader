@@ -12,7 +12,7 @@ import Module from 'node:module';
 const SRC = fileURLToPath(new URL('../main.js', import.meta.url));
 const source = readFileSync(SRC, 'utf8') +
   '\nmodule.exports.__test = { LibraryModal, AppearanceModal, NotePickModal, ReaderSettingTab,' +
-  ' MdReaderPlugin, DEFAULT_SETTINGS };\n';
+  ' MdReaderPlugin, ReaderView, DEFAULT_SETTINGS };\n';
 
 /* ---------- минимальный DOM ---------- */
 class El {
@@ -157,6 +157,29 @@ plugin.importBook = () => {};
 let pass = 0, fail = 0;
 const ok = (name, cond, extra) => { if (cond) { pass++; return; } fail++; console.log('  FAIL: ' + name + (extra === undefined ? '' : '  -> ' + JSON.stringify(extra))); };
 const eq = (name, a, b) => ok(name, JSON.stringify(a) === JSON.stringify(b), { got: a, want: b });
+
+/* ---------- optional transcript page-link hook ---------- */
+const chapter = Object.create(T.ReaderView.prototype);
+const chapterCalls = [];
+chapter.app = { plugins: { plugins: { 'nomad-transcripts': { pageLinks: {
+  enabled: () => true,
+  async renderSection(section) { chapterCalls.push(section); return true; },
+} } } } };
+chapter.file = { path: 'Transcripts/book.md' };
+chapter.chapterSourceLineMaps = [[4, 8, null, 12]];
+const chapterEl = {};
+const chapterComponent = {};
+await chapter.renderChapterMarkdown(0, 'chapter markdown', chapterEl, chapterComponent);
+eq('reader page links: optional hook receives canonical path and mapped source lines', chapterCalls.map(call => [call.sourcePath, call.markdown, call.sourceLineMap, call.element, call.component]),
+  [['Transcripts/book.md', 'chapter markdown', [4, 8, null, 12], chapterEl, chapterComponent]]);
+eq('reader page links: one adapter call per rendered chapter', chapterCalls.length, 1);
+
+let ordinaryRenderCalls = 0;
+obsidian.MarkdownRenderer.render = async (_app, markdown) => { ordinaryRenderCalls++; chapter.lastOrdinaryMarkdown = markdown; };
+chapter.app.plugins.plugins['nomad-transcripts'].pageLinks.enabled = () => false;
+chapter.app.plugins.plugins['nomad-transcripts'].pageLinks.renderSection = async () => { throw new Error('disabled integration should not run'); };
+await chapter.renderChapterMarkdown(0, 'plain markdown', chapterEl, chapterComponent);
+eq('reader page links: disabled or absent integration uses normal MarkdownRenderer', [ordinaryRenderCalls, chapter.lastOrdinaryMarkdown], [1, 'plain markdown']);
 
 /* ---------- состав библиотеки ---------- */
 const items = plugin.libraryFiles();
@@ -505,6 +528,32 @@ quotePlugin.settings.importFolder = 'Books'; quotePlugin.library = []; quotePlug
 quoteFiles.get('Books/Quotes').children = [firstQuote, otherQuote];
 quoteFiles.get('Books').children = [quoteSource, quoteFiles.get('Books/Quotes')];
 eq('quote: quotes subfolder is not imported as books', quotePlugin.libraryFiles().map(entry => entry.file.path), ['Books/Book.md']);
+
+/* ---------- optional transcript-link refresh keeps reader location ---------- */
+const linkReader = Object.create(T.ReaderView.prototype);
+let linkReaderReloads = 0;
+linkReader.file = quoteSource;
+linkReader.content = { isConnected: true };
+linkReader._measured = true;
+linkReader._readingAnchor = { text: 'chapter phrase', occurrence: 2 };
+linkReader.currentG = () => 0.625;
+linkReader.captureAnchor = () => ({ text: 'fallback' });
+linkReader.renderFile = () => { linkReaderReloads++; };
+linkReader.refreshTranscriptLinks();
+eq('transcript-link refresh: chapter rerendered once', linkReaderReloads, 1);
+eq('transcript-link refresh: global reading fraction retained', linkReader._keepG, 0.625);
+eq('transcript-link refresh: text anchor retained', linkReader._keepAnchor, { text: 'chapter phrase', occurrence: 2 });
+
+const refreshPlugin = Object.create(T.MdReaderPlugin.prototype);
+let requestedReaderType;
+let openReaderRefreshes = 0;
+refreshPlugin.app = { workspace: { getLeavesOfType: (type) => {
+  requestedReaderType = type;
+  return [{ view: { refreshTranscriptLinks() { openReaderRefreshes++; } } }];
+} } };
+refreshPlugin.refreshTranscriptLinks();
+eq('transcript-link refresh: only reader leaves requested', requestedReaderType, 'horizontal-reader-view');
+eq('transcript-link refresh: open reader hook invoked', openReaderRefreshes, 1);
 
 console.log(`\n${pass} прошло, ${fail} упало`);
 process.exit(fail ? 1 : 0);

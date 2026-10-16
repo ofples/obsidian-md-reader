@@ -836,15 +836,58 @@ function tocFromBody(body, chapter) {
 
 // разрезать большой текст без заголовков на куски ~target символов по границам абзацев
 function chunkBySize(text, target) {
-  const paras = text.split(/\n{2,}/);
-  const chunks = [];
-  let buf = '';
-  for (const p of paras) {
-    if (buf && buf.length + p.length > target) { chunks.push(buf.trim()); buf = ''; }
-    buf += (buf ? '\n\n' : '') + p;
+  return chunkBySizeMapped(text, target).chunks;
+}
+
+// Keep each rendered line tied to its original file line while packing paragraphs.
+// Null entries are separators added by the packer and have no source location.
+function chunkBySizeMapped(text, target, sourceLineMap) {
+  const lineMap = Array.isArray(sourceLineMap)
+    ? sourceLineMap
+    : Array.from({ length: String(text).split('\n').length }, (_, i) => i);
+  const paras = [];
+  const sepRe = /\n{2,}/g;
+  let cursor = 0, lineCursor = 0, match;
+  while ((match = sepRe.exec(text))) {
+    const value = text.slice(cursor, match.index);
+    const lineCount = value.split('\n').length;
+    paras.push({ text: value, lines: lineMap.slice(lineCursor, lineCursor + lineCount) });
+    lineCursor += lineCount + (match[0].match(/\n/g) || []).length - 1;
+    cursor = match.index + match[0].length;
   }
-  if (buf.trim()) chunks.push(buf.trim());
-  return chunks.length ? chunks : [text];
+  const tail = text.slice(cursor);
+  paras.push({ text: tail, lines: lineMap.slice(lineCursor, lineCursor + tail.split('\n').length) });
+
+  const chunks = [];
+  const sourceLineMaps = [];
+  let buf = '';
+  let bufLines = [];
+  const flush = () => {
+    const leading = (buf.slice(0, buf.length - buf.trimStart().length).match(/\n/g) || []).length;
+    const trailing = (buf.slice(buf.trimEnd().length).match(/\n/g) || []).length;
+    const value = buf.trim();
+    if (value) {
+      chunks.push(value);
+      sourceLineMaps.push(bufLines.slice(leading, Math.max(leading, bufLines.length - trailing)));
+    }
+    buf = '';
+    bufLines = [];
+  };
+  for (const p of paras) {
+    if (!buf && !p.text) continue;
+    if (buf && buf.length + p.text.length > target) flush();
+    if (buf) { buf += '\n\n'; bufLines.push(null); }
+    buf += p.text;
+    bufLines.push(...p.lines);
+  }
+  flush();
+  return chunks.length ? { chunks, sourceLineMaps } : { chunks: [text], sourceLineMaps: [lineMap] };
+}
+
+function sourceLineOffset(raw, body) {
+  return raw.length > body.length
+    ? (raw.slice(0, raw.length - body.length).match(/\n/g) || []).length
+    : 0;
 }
 
 // -> { chapters: string[], toc: [{text, level, chapter, hIndex}], chars: number[] }
@@ -856,14 +899,15 @@ function splitChapters(body, targets) {
   const SPLIT = T.split > 0 ? T.split : CHAPTER_SPLIT_THRESHOLD;
   const PACK = T.pack > 0 ? T.pack : CHAPTER_PACK_TARGET;
   const CHUNK = T.chunk > 0 ? T.chunk : CHAPTER_CHUNK_TARGET;
+  const sourceLineMap = Array.from({ length: body.split('\n').length }, (_, i) => i);
   if (body.length <= SPLIT) {
-    return { chapters: [body], toc: tocFromBody(body, 0), chars: [body.length] };
+    return { chapters: [body], sourceLineMaps: [sourceLineMap], toc: tocFromBody(body, 0), chars: [body.length] };
   }
   const lines = body.split('\n');
   const headings = scanHeadings(lines);
   if (!headings.length) {
-    const chunks = chunkBySize(body, CHUNK);
-    return { chapters: chunks, toc: [], chars: chunks.map((c) => c.length) };
+    const split = chunkBySizeMapped(body, CHUNK, sourceLineMap);
+    return { chapters: split.chunks, sourceLineMaps: split.sourceLineMaps, toc: [], chars: split.chunks.map((c) => c.length) };
   }
 
   // секции: начало = строка 0 (преамбула) и каждая строка-заголовок
@@ -872,18 +916,24 @@ function splitChapters(body, targets) {
   const starts = Array.from(new Set([0, ...headings.map((h) => h.line)])).sort((a, b) => a - b);
   const sections = starts.map((s, k) => {
     const e = k + 1 < starts.length ? starts[k + 1] : lines.length;
-    return { text: lines.slice(s, e).join('\n'), heading: byLine.has(s) ? byLine.get(s) : -1 };
+    return { text: lines.slice(s, e).join('\n'), sourceLines: sourceLineMap.slice(s, e), heading: byLine.has(s) ? byLine.get(s) : -1 };
   });
 
   const chapters = [];
+  const sourceLineMaps = [];
   const toc = [];
   let buf = '';
+  let bufLines = [];
   let curChapter = 0;
   let curHCount = 0;
   const flush = () => {
     if (buf === '') return;
+    const leading = /^\n+/.exec(buf)?.[0].length || 0;
+    const trailing = /\n+$/.exec(buf)?.[0].length || 0;
     chapters.push(buf.replace(/^\n+/, '').replace(/\n+$/, ''));
+    sourceLineMaps.push(bufLines.slice(leading, Math.max(leading, bufLines.length - trailing)));
     buf = '';
+    bufLines = [];
     curChapter++;
     curHCount = 0;
   };
@@ -892,9 +942,10 @@ function splitChapters(body, targets) {
     // одиночная секция больше лимита — режем её по размеру, заголовок идёт с первым куском
     if (sec.text.length > PACK) {
       if (buf !== '') flush();
-      const pieces = chunkBySize(sec.text, CHUNK);
-      pieces.forEach((piece, pi) => {
+      const split = chunkBySizeMapped(sec.text, CHUNK, sec.sourceLines);
+      split.chunks.forEach((piece, pi) => {
         buf = piece;
+        bufLines = split.sourceLineMaps[pi];
         if (pi === 0 && sec.heading >= 0) {
           const h = headings[sec.heading];
           toc.push({ text: h.text, level: h.level, chapter: curChapter, hIndex: 0, line: h.line });
@@ -911,10 +962,11 @@ function splitChapters(body, targets) {
       curHCount++;
     }
     buf += (buf ? '\n' : '') + sec.text;
+    bufLines.push(...sec.sourceLines);
   }
   flush();
 
-  return { chapters, toc, chars: chapters.map((c) => c.length) };
+  return { chapters, sourceLineMaps, toc, chars: chapters.map((c) => c.length) };
 }
 
 /* ---------- сноски ---------- */
@@ -1231,6 +1283,7 @@ class ReaderView extends ItemView {
     this._pendingFind = null;      // {query, ordinal, fraction} — отложенный прыжок к находке
     this._searchIndex = null;      // {path, low[], src[]} — видимый текст глав и он же в нижнем регистре, для поиска
     this.chapters = null;     // markdown по главам (для мелких заметок — одна глава = весь текст)
+    this.chapterSourceLineMaps = [];
     this.chapterIndex = 0;
     this.toc = [];            // все заголовки: {text, level, chapter, hIndex, line}
     this.chapterChars = [];
@@ -1440,6 +1493,7 @@ class ReaderView extends ItemView {
     this._measured = false;
     if (!this.file) {
       this.chapters = null; this.toc = []; this.chapterIndex = 0;
+      this.chapterSourceLineMaps = [];
       this.content.empty();
       this.content.createDiv('hr-empty').setText(t('notFound'));
       return;
@@ -1457,9 +1511,7 @@ class ReaderView extends ItemView {
     body = body.replace(/^\s+/, '');
     // сколько строк файла осталось выше тела: номера строк в оглавлении считаются от
     // начала тела, а редактор открывается по строке ФАЙЛА
-    this.bodyLine0 = raw.length > body.length
-      ? (raw.slice(0, raw.length - body.length).match(/\n/g) || []).length
-      : 0;
+    this.bodyLine0 = sourceLineOffset(raw, body);
     this.textLang = guessLang(body);
 
     // сноски: определения вынимаем, ссылки заменяем по режиму. ДО разбиения на блоки —
@@ -1474,6 +1526,7 @@ class ReaderView extends ItemView {
     // разбить на главы (мелкие файлы → одна глава = весь текст) и посчитать метрики прогресса
     const split = splitChapters(body, this.plugin.blockTargets());
     this.chapters = split.chapters;
+    this.chapterSourceLineMaps = split.sourceLineMaps.map(lines => lines.map(line => line == null ? null : line + this.bodyLine0));
     this.toc = split.toc;
     this.chapterChars = split.chars;
     this.totalChars = split.chars.reduce((a, b) => a + b, 0);
@@ -1529,6 +1582,26 @@ class ReaderView extends ItemView {
     return within;
   }
 
+  async renderChapterMarkdown(index, markdown, target, component) {
+    const pageLinks = this.app?.plugins?.plugins?.['nomad-transcripts']?.pageLinks;
+    if (pageLinks && typeof pageLinks.enabled === 'function' && typeof pageLinks.renderSection === 'function' &&
+        pageLinks.enabled() && this.file && Array.isArray(this.chapterSourceLineMaps?.[index])) {
+      try {
+        if (await pageLinks.renderSection({
+          element: target,
+          sourcePath: this.file.path,
+          markdown,
+          sourceLineMap: this.chapterSourceLineMaps[index],
+          component,
+        })) return;
+      } catch (e) {
+        console.warn('MD Reader: page links could not be rendered', e);
+        while (target.firstChild) target.removeChild(target.firstChild);
+      }
+    }
+    await MarkdownRenderer.render(this.app, markdown, target, this.file.path, component);
+  }
+
   // отрисовать ОДНУ главу; opts = { fraction } (0=начало, 1=конец) или { heading: {index, text} }
   async renderChapter(index, opts) {
     if (!this.content || !this.file || !this.chapters) return;
@@ -1578,7 +1651,7 @@ class ReaderView extends ItemView {
       this.renderChild = new Component();
       this.addChild(this.renderChild);
       try {
-        await MarkdownRenderer.render(this.app, this.chapters[this.chapterIndex] || '', this.content, this.file.path, this.renderChild);
+        await this.renderChapterMarkdown(this.chapterIndex, this.chapters[this.chapterIndex] || '', this.content, this.renderChild);
       } catch (e) {
         console.error('MD Reader: ошибка рендера Markdown', e);
       }
@@ -1801,7 +1874,7 @@ class ReaderView extends ItemView {
     const entry = { index, el, comp, file: this.file.path, ready: false };
     this._prefetch = entry;
     try {
-      await MarkdownRenderer.render(this.app, this.chapters[index] || '', el, this.file.path, comp);
+      await this.renderChapterMarkdown(index, this.chapters[index] || '', el, comp);
     } catch (e) { /* не критично: при переходе отрендерим обычным путём */ }
     // за время рендера ситуация могла смениться (другой файл/блок) — выбросить.
     // Если его уже выбросил discardPrefetch, второй раз удалять компонент нельзя
@@ -2861,6 +2934,13 @@ class ReaderView extends ItemView {
     this._keepG = this._measured ? this.currentG() : null;
     this._keepAnchor = this._readingAnchor || this.captureAnchor();
     this.renderFile();
+  }
+
+  // An optional companion plugin can change reader decorations without
+  // reloading the Obsidian Markdown leaves. Re-render this chapter and discard
+  // its prefetched neighbor while retaining the current reading anchor.
+  refreshTranscriptLinks() {
+    this.reloadKeepingPlace();
   }
 
   setupRepagination() {
@@ -4491,6 +4571,7 @@ class MdReaderPlugin extends Plugin {
           v.file = null;
           v.filePath = null;
           v.chapters = null;
+          v.chapterSourceLineMaps = [];
           v.toc = [];
           if (v.clearCache) v.clearCache();
           if (v.content) { v.content.empty(); v.content.createDiv('hr-empty').setText(t('notFound')); }
@@ -4504,6 +4585,16 @@ class MdReaderPlugin extends Plugin {
       const s = JSON.stringify(this.dataBlob());
       if (s !== this.lastSaved) { this.saveData(JSON.parse(s)); this.lastSaved = s; }
     }, 2000));
+  }
+
+  // Optional cross-plugin hook used by Nomad Transcripts when its page-link
+  // setting changes. Keep this independent from any other reader integrations.
+  refreshTranscriptLinks() {
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_READER);
+    for (const leaf of leaves) {
+      const view = leaf.view;
+      if (view && typeof view.refreshTranscriptLinks === 'function') view.refreshTranscriptLinks();
+    }
   }
 
   // отложить запись на диск: ползунок настроек шлёт onChange на каждый шаг, и

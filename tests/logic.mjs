@@ -10,7 +10,7 @@ import Module from 'node:module';
 
 const SRC = fileURLToPath(new URL('../main.js', import.meta.url));
 const source = readFileSync(SRC, 'utf8') +
-  '\nmodule.exports.__test = { scanHeadings, splitChapters, chunkBySize, txtToMarkdown,' +
+  '\nmodule.exports.__test = { scanHeadings, splitChapters, chunkBySize, chunkBySizeMapped, sourceLineOffset, txtToMarkdown,' +
   ' normHeading, escapeMd, escapeBlockStart, decodeBuffer, ReaderView, sanitizeFilename,' +
   ' guessLang, anchorMatch, anchorSourceText, applyReadingPreset, DEFAULT_SETTINGS,' +
   ' extractFootnotes, applyFootnoteRefs, prepareFootnotes, noteRef, footnoteDefs };\n';
@@ -64,6 +64,7 @@ const split = T.splitChapters(book);
 ok('splitChapters: книга разрезана', split.chapters.length > 1, split.chapters.length);
 eq('splitChapters: оглавление полное', split.toc.length, 12);
 eq('splitChapters: chars совпадает с главами', split.chars, split.chapters.map((c) => c.length));
+eq('splitChapters: source maps keep every rendered line', split.sourceLineMaps.map((m, i) => m.length === split.chapters[i].split('\n').length), split.chapters.map(() => true));
 ok('splitChapters: главы не длиннее лимита*1.2',
   split.chapters.every((c) => c.length <= 200000 * 1.2), split.chapters.map((c) => c.length));
 ok('splitChapters: номера блоков в оглавлении валидны',
@@ -76,6 +77,52 @@ ok('splitChapters: hIndex по порядку с нуля',
 const small = T.splitChapters('# Заметка\n\nкороткий текст');
 eq('splitChapters: мелкая заметка = одна глава', small.chapters.length, 1);
 eq('splitChapters: оглавление мелкой заметки', small.toc.length, 1);
+
+const mappedBook = [
+  '# Повтор', '<!-- supernote-page:first number:1 -->', 'Одинаковый текст.', '',
+  '# Повтор', '<!-- supernote-page:second number:2 -->', 'Одинаковый текст.', '',
+  '# Повтор', '<!-- supernote-page:third number:3 -->', 'Одинаковый текст.',
+].join('\n');
+const mappedSplit = T.splitChapters(mappedBook, { split: 1, pack: 1000, chunk: 32 });
+const fileWithYaml = `---\nnomad_transcripts: true\n---\n\n${mappedBook}`;
+const strippedBody = fileWithYaml.slice(fileWithYaml.indexOf('---\n\n') + 5).replace(/^\s+/, '');
+const absoluteLineOffset = T.sourceLineOffset(fileWithYaml, strippedBody);
+const markerSourceLines = new Map(mappedBook.split('\n').map((line, index) => {
+  const id = line.match(/supernote-page:([^ ]+)/)?.[1];
+  return id ? [id, index] : null;
+}).filter(Boolean));
+const mappedMarkers = [];
+eq('page-link source maps: packed chapter line counts stay aligned', mappedSplit.sourceLineMaps.map((m, i) => m.length === mappedSplit.chapters[i].split('\n').length), mappedSplit.chapters.map(() => true));
+mappedSplit.chapters.forEach((chapter, chapterIndex) => {
+  const lines = chapter.split('\n');
+  lines.forEach((line, localLine) => {
+    const id = line.match(/supernote-page:([^ ]+)/)?.[1];
+    if (!id) return;
+    mappedMarkers.push([id, mappedSplit.sourceLineMaps[chapterIndex][localLine] + absoluteLineOffset]);
+  });
+});
+eq('page-link source maps: duplicate chapter text retains exact marker lines', mappedMarkers,
+  ['first', 'second', 'third'].map(id => [id, markerSourceLines.get(id) + absoluteLineOffset]));
+eq('page-link source maps: YAML body offset starts at the original file line', absoluteLineOffset,
+  (fileWithYaml.slice(0, fileWithYaml.indexOf('# Повтор')).match(/\n/g) || []).length);
+
+const mappedChunksBody = [
+  'Одинаковый текст.', '<!-- supernote-page:chunk-one number:1 -->', '',
+  'Одинаковый текст.', '<!-- supernote-page:chunk-two number:2 -->', '',
+  'Одинаковый текст.', '<!-- supernote-page:chunk-three number:3 -->',
+].join('\n\n');
+const mappedChunks = T.splitChapters(mappedChunksBody, { split: 1, chunk: 36 });
+const chunkMarkerLines = new Map(mappedChunksBody.split('\n').map((line, index) => {
+  const id = line.match(/supernote-page:([^ ]+)/)?.[1];
+  return id ? [id, index] : null;
+}).filter(Boolean));
+const chunkMarkers = [];
+mappedChunks.chapters.forEach((chapter, chapterIndex) => chapter.split('\n').forEach((line, localLine) => {
+  const id = line.match(/supernote-page:([^ ]+)/)?.[1];
+  if (id) chunkMarkers.push([id, mappedChunks.sourceLineMaps[chapterIndex][localLine]]);
+}));
+eq('page-link source maps: paragraph chunks preserve source ranges', chunkMarkers,
+  ['chunk-one', 'chunk-two', 'chunk-three'].map(id => [id, chunkMarkerLines.get(id)]));
 
 /* ---------- позиция в книге (то, что правил аудит) ---------- */
 const view = Object.create(T.ReaderView.prototype);
