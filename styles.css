@@ -557,6 +557,41 @@
 }
 .hr-ui { transition: opacity 0.2s ease; }
 
+/* Reader-owned gesture controls stay usable when a theme does not provide
+   Supernote Paper's presentation styles. */
+.hr-viewport > .sn-page-indicator {
+  position: absolute;
+  z-index: 7;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  padding: 4px 8px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 0.9em;
+  line-height: 1.25;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.hr-viewport > .sn-page-indicator[hidden] { display: none !important; }
+
+.menu.sn-reader-menu { z-index: 1000; }
+.sn-reader-menu-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 44px;
+  padding: 4px 10px 4px 14px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  font-weight: 600;
+}
+.sn-reader-menu-close {
+  min-width: 40px;
+  min-height: 40px;
+  font-size: 1.5em;
+}
+
 /* ===== Отбивка «Конец» на последней странице ===== */
 .hr-end {
   position: absolute;

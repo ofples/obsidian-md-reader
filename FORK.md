@@ -1,5 +1,11 @@
 # Supernote fork
 
+## 2.1.2 release preparation
+
+This repository is the canonical reader source for standalone use and optional Paper distributions. Its existing accepted Paper reader adaptations were reconciled against Paper's generated 2.1.0 copy; that copy lacks this fork's transcript source mapping and adapter. Paper should consume a pinned artifact from here rather than maintain a second reader patch pipeline.
+
+The candidate adds a version-aware optional Transcripts adapter, normal Markdown fallback on unavailable/failed adapters, guarded optional Sidebar navigation and reader-owned base control styles. It keeps upstream font defaults and normal font fallbacks. See [integration boundaries](INTEGRATION.md) and [candidate notes](release-notes/2.1.2.md). Version 2.1.1 remains the last device-verified version; no candidate is installed by this preparation work.
+
 ## Provenance and license
 
 This repository is a public fork of [mrrepac/obsidian-md-reader](https://github.com/mrrepac/obsidian-md-reader), based on upstream commit `b23d62ce4d341ed230ff403b0f292385b41d0364` (version 2.1.0). The upstream [MIT license](LICENSE) is retained. Preserve upstream source, tests, and documentation when adding fork-specific work.

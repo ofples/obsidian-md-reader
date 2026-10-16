@@ -176,10 +176,76 @@ eq('reader page links: one adapter call per rendered chapter', chapterCalls.leng
 
 let ordinaryRenderCalls = 0;
 obsidian.MarkdownRenderer.render = async (_app, markdown) => { ordinaryRenderCalls++; chapter.lastOrdinaryMarkdown = markdown; };
+
+const makeTarget = () => ({
+  children: [], get firstChild() { return this.children[0] || null; },
+  removeChild(node) { this.children.splice(this.children.indexOf(node), 1); },
+});
+const partialTarget = makeTarget();
+chapter.app.plugins.plugins['nomad-transcripts'].pageLinks.apiVersion = 2;
+chapter.app.plugins.plugins['nomad-transcripts'].pageLinks.enabled = () => true;
+chapter.app.plugins.plugins['nomad-transcripts'].pageLinks.renderSection = async () => { throw new Error('unsupported adapter must not run'); };
+await chapter.renderChapterMarkdown(0, 'unsupported markdown', partialTarget, chapterComponent);
+eq('reader page links: unsupported API version skips adapter and uses MarkdownRenderer', [partialTarget.children.length, ordinaryRenderCalls, chapter.lastOrdinaryMarkdown], [0, 1, 'unsupported markdown']);
+
+chapter.app.plugins.plugins['nomad-transcripts'].pageLinks.apiVersion = 1;
+chapter.app.plugins.plugins['nomad-transcripts'].pageLinks.enabled = () => { throw new Error('enabled failed'); };
+partialTarget.children.push({});
+await chapter.renderChapterMarkdown(0, 'enabled failure markdown', partialTarget, chapterComponent);
+eq('reader page links: enabled failure clears partial nodes and falls back', [partialTarget.children.length, ordinaryRenderCalls, chapter.lastOrdinaryMarkdown], [0, 2, 'enabled failure markdown']);
+
+chapter.app.plugins.plugins['nomad-transcripts'].pageLinks.enabled = () => true;
+chapter.app.plugins.plugins['nomad-transcripts'].pageLinks.renderSection = async ({ element }) => { element.children.push({ partial: true }); return false; };
+await chapter.renderChapterMarkdown(0, 'declined markdown', partialTarget, chapterComponent);
+eq('reader page links: false result clears partial nodes before fallback', [partialTarget.children.length, ordinaryRenderCalls, chapter.lastOrdinaryMarkdown], [0, 3, 'declined markdown']);
+
+chapter.app.plugins.plugins['nomad-transcripts'].pageLinks.apiVersion = 1;
+chapter.app.plugins.plugins['nomad-transcripts'].pageLinks.enabled = () => true;
+chapter.app.plugins.plugins['nomad-transcripts'].pageLinks.renderSection = async ({ element }) => { element.children.push({ partial: true }); throw new Error('render failed'); };
+await chapter.renderChapterMarkdown(0, 'render failure markdown', partialTarget, chapterComponent);
+eq('reader page links: render failure clears partial nodes before fallback', [partialTarget.children.length, ordinaryRenderCalls, chapter.lastOrdinaryMarkdown], [0, 4, 'render failure markdown']);
+
 chapter.app.plugins.plugins['nomad-transcripts'].pageLinks.enabled = () => false;
 chapter.app.plugins.plugins['nomad-transcripts'].pageLinks.renderSection = async () => { throw new Error('disabled integration should not run'); };
 await chapter.renderChapterMarkdown(0, 'plain markdown', chapterEl, chapterComponent);
-eq('reader page links: disabled or absent integration uses normal MarkdownRenderer', [ordinaryRenderCalls, chapter.lastOrdinaryMarkdown], [1, 'plain markdown']);
+eq('reader page links: disabled or absent integration uses normal MarkdownRenderer', [ordinaryRenderCalls, chapter.lastOrdinaryMarkdown], [5, 'plain markdown']);
+
+const editorReader = Object.create(T.ReaderView.prototype);
+let openedNormally = null;
+editorReader.app = { plugins: { plugins: { 'supernote-sidebar': { edit() { throw new Error('sidebar unavailable'); } } } }, workspace: {
+  getLeaf() { return { openFile(file, opts) { openedNormally = [file.path, opts]; } }; },
+} };
+editorReader.file = { path: 'Books/standalone.md' };
+editorReader.toc = [];
+editorReader.bodyLine0 = 3;
+editorReader.currentTocIndex = () => -1;
+editorReader.savePos = () => {};
+await editorReader.openInEditor();
+eq('sidebar edit failure falls back to ordinary note navigation', openedNormally, ['Books/standalone.md', { eState: { line: 0 } }]);
+
+const rejectedEditorReader = Object.create(T.ReaderView.prototype);
+let rejectedEditFallback = null;
+rejectedEditorReader.app = { plugins: { plugins: { 'supernote-sidebar': { edit: async () => { throw new Error('async edit rejected'); } } } }, workspace: {
+  getLeaf() { return { async openFile(file, opts) { rejectedEditFallback = [file.path, opts.eState.line]; } }; },
+} };
+rejectedEditorReader.file = { path: 'Books/rejected-edit.md' };
+rejectedEditorReader.toc = [];
+rejectedEditorReader.bodyLine0 = 0;
+rejectedEditorReader.currentTocIndex = () => -1;
+rejectedEditorReader.savePos = () => {};
+await rejectedEditorReader.openInEditor();
+eq('sidebar async edit rejection is contained and falls back to ordinary note navigation', rejectedEditFallback, ['Books/rejected-edit.md', 0]);
+
+const rejectedScrollReader = Object.create(T.ReaderView.prototype);
+let rejectedScrollFallback = null;
+rejectedScrollReader.app = { plugins: { plugins: { 'supernote-sidebar': { read: async () => { throw new Error('async read rejected'); } } } }, workspace: {
+  getLeaf(kind) { return { async openFile(file, opts) { rejectedScrollFallback = [kind, file.path, opts]; } }; },
+} };
+rejectedScrollReader.file = { path: 'Books/rejected-scroll.md' };
+rejectedScrollReader.leaf = {};
+rejectedScrollReader.savePos = () => {};
+await rejectedScrollReader.readWithScrolling();
+eq('sidebar async scroll rejection falls back to standard Markdown preview mode', rejectedScrollFallback, ['tab', 'Books/rejected-scroll.md', { state: { mode: 'preview' } }]);
 
 /* ---------- состав библиотеки ---------- */
 const items = plugin.libraryFiles();

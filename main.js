@@ -1584,16 +1584,19 @@ class ReaderView extends ItemView {
 
   async renderChapterMarkdown(index, markdown, target, component) {
     const pageLinks = this.app?.plugins?.plugins?.['nomad-transcripts']?.pageLinks;
-    if (pageLinks && typeof pageLinks.enabled === 'function' && typeof pageLinks.renderSection === 'function' &&
-        pageLinks.enabled() && this.file && Array.isArray(this.chapterSourceLineMaps?.[index])) {
+    const compatible = pageLinks && (pageLinks.apiVersion === undefined || pageLinks.apiVersion === 1);
+    if (compatible && typeof pageLinks.enabled === 'function' && typeof pageLinks.renderSection === 'function' &&
+        this.file && Array.isArray(this.chapterSourceLineMaps?.[index])) {
       try {
-        if (await pageLinks.renderSection({
+        if (pageLinks.enabled() && await pageLinks.renderSection({
           element: target,
           sourcePath: this.file.path,
           markdown,
           sourceLineMap: this.chapterSourceLineMaps[index],
           component,
         })) return;
+        // A declined adapter may have written some nodes before returning false.
+        while (target.firstChild) target.removeChild(target.firstChild);
       } catch (e) {
         console.warn('MD Reader: page links could not be rendered', e);
         while (target.firstChild) target.removeChild(target.firstChild);
@@ -2279,9 +2282,12 @@ class ReaderView extends ItemView {
   /* ---------- заметка в редакторе ---------- */
   // Читаешь свою заметку, видишь опечатку — и до сих пор её нечем было поправить:
   // приходилось искать файл руками. Открываем исходник на строке текущей главы
-  openInEditor() {
+  async openInEditor() {
     const controls = this.app?.plugins?.plugins?.['supernote-sidebar'];
-    if (controls?.edit) { controls.edit(this.leaf); return; } // Use the same note tab and preserve the current passage.
+    if (typeof controls?.edit === 'function') {
+      try { await controls.edit(this.leaf); return; } // Use the same note tab and preserve the current passage.
+      catch (e) { console.warn('MD Reader: sidebar edit hook failed; opening the note normally', e); }
+    }
     if (!this.file) return;
     const idx = this.currentTocIndex();
     const line = idx >= 0 && typeof this.toc[idx].line === 'number'
@@ -2289,7 +2295,21 @@ class ReaderView extends ItemView {
       : 0;
     this.savePos();
     const leaf = this.app.workspace.getLeaf('tab');
-    leaf.openFile(this.file, { eState: { line } });
+    await leaf.openFile(this.file, { eState: { line } });
+  }
+
+  async readWithScrolling() {
+    const controls = this.app?.plugins?.plugins?.['supernote-sidebar'];
+    try {
+      if (typeof controls?.read !== 'function') throw new Error('sidebar read hook is unavailable');
+      await controls.read(this.leaf, 'scroll');
+      return;
+    } catch (e) {
+      console.warn('MD Reader: sidebar scroll hook failed; opening the note normally', e);
+    }
+    if (!this.file) return;
+    this.savePos();
+    await this.app.workspace.getLeaf('tab').openFile(this.file, { state: { mode: 'preview' } });
   }
 
   /* ---------- navigation menu (главная точка входа: тап по проценту) ---------- */
@@ -2367,11 +2387,16 @@ class ReaderView extends ItemView {
     menu.addItem((i) => i.setTitle(t('menuBmList')).setIcon('bookmark').onClick(() => this.openBookmarks()));
     const controls = this.app?.plugins?.plugins?.['supernote-sidebar'];
     menu.addItem(i => i.setTitle('Go to start').setIcon('skip-back').onClick(() => this.goToBookEdge(0)));
-    if (controls?.toggleFullscreen) {
-      menu.addItem(i => i.setTitle('Read with scrolling').setIcon('book-open').onClick(() => controls.read(this.leaf,'scroll')));
+    if (typeof controls?.read === 'function' && typeof controls?.toggleFullscreen === 'function') {
+      menu.addItem(i => i.setTitle('Read with scrolling').setIcon('book-open').onClick(() => this.readWithScrolling()));
       menu.addSeparator();
-      menu.addItem(i => i.setTitle(controls.isFullscreen() ? 'Exit fullscreen reading' : 'Enter fullscreen reading')
-        .setIcon(controls.isFullscreen() ? 'minimize' : 'maximize').onClick(() => controls.toggleFullscreen()));
+      let sidebarFullscreen = false;
+      try { sidebarFullscreen = typeof controls.isFullscreen === 'function' && controls.isFullscreen(); }
+      catch (e) { console.warn('MD Reader: sidebar fullscreen state hook failed', e); }
+      menu.addItem(i => i.setTitle(sidebarFullscreen ? 'Exit fullscreen reading' : 'Enter fullscreen reading')
+        .setIcon(sidebarFullscreen ? 'minimize' : 'maximize').onClick(() => {
+          try { controls.toggleFullscreen(); } catch (e) { console.warn('MD Reader: sidebar fullscreen hook failed', e); }
+        }));
     } else if (Platform.isDesktop) {
       menu.addSeparator();
       const doc = this.contentEl.ownerDocument;
@@ -3006,8 +3031,10 @@ class ReaderView extends ItemView {
   onEscape() {
     if (this._snReaderMenuOpen || (typeof document !== 'undefined' && document.querySelector('.menu,.modal-container'))) return; // Dismiss overlays before acting on the note.
     const controls = this.app?.plugins?.plugins?.['supernote-sidebar'];
-    if (controls && document.body.matches('.sn-left-open,.sn-right-open')) { controls.closeDrawers(); return; }
-    if (controls?.isFullscreen?.()) { controls.toggleFullscreen(); return; }
+    try {
+      if (typeof controls?.closeDrawers === 'function' && document.body.matches('.sn-left-open,.sn-right-open')) { controls.closeDrawers(); return; }
+      if (typeof controls?.isFullscreen === 'function' && controls.isFullscreen() && typeof controls.toggleFullscreen === 'function') { controls.toggleFullscreen(); return; }
+    } catch (e) { console.warn('MD Reader: sidebar Escape hook failed; using reader navigation', e); }
     if (this.closeFootnote(true)) return; // сначала закрыть открытую сноску
     if (this.chromeHidden()) { this.exitReadingChrome(); return; }
     if (this.plugin) this.plugin.exitReader(this.leaf);
@@ -4638,13 +4665,20 @@ class MdReaderPlugin extends Plugin {
 
   async openReader(file) {
     const controls = this.app?.plugins?.plugins?.['supernote-sidebar'];
-    const existing = controls?.findOpenFile?.(file.path);
+    let existing = null;
+    try { if (typeof controls?.findOpenFile === 'function') existing = controls.findOpenFile(file.path); }
+    catch (e) { console.warn('MD Reader: sidebar lookup hook failed; opening a reader tab normally', e); }
     if (existing) {
-      await existing.loadIfDeferred?.();
-      if (existing.view.getViewType() !== VIEW_TYPE_READER) await controls.read(existing,'pages');
-      await this.app.workspace.revealLeaf(existing);
-      this.app.workspace.setActiveLeaf(existing,{focus:true});
-      return;
+      try {
+        if (typeof existing.loadIfDeferred === 'function') await existing.loadIfDeferred();
+        if (existing.view?.getViewType?.() !== VIEW_TYPE_READER) {
+          if (typeof controls.read !== 'function') throw new Error('sidebar read hook is unavailable');
+          await controls.read(existing, 'pages');
+        }
+        await this.app.workspace.revealLeaf(existing);
+        this.app.workspace.setActiveLeaf(existing, { focus: true });
+        return;
+      } catch (e) { console.warn('MD Reader: sidebar navigation hook failed; opening a reader tab normally', e); }
     }
     // заходим в книгу — значит заходим и в иммерсив, даже если в прошлый раз
     // хром был показан руками
