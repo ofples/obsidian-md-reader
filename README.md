@@ -4,7 +4,7 @@
 
 ## Supernote fork version 2.1.1
 
-The fork preserves MD Reader's upstream source and adds an optional adapter for page links in managed Supernote transcripts. It supplies canonical source-line maps before pagination and validates links against the original transcript. Native Digest capture is not implemented. Reader logic and UI checks pass (**123/123** and **106/106**); page-link browser/integration checks pass **5/5**. Version 2.1.1 is active on the Nomad with all three installed artifact hashes matching approved files; MD Reader is absent on desktop Vedas. Activation preserved reader settings/data and made zero recognition requests. Bounded live UI checks are in progress; see the parent plugin's private device evidence for the activation readback.
+The fork preserves MD Reader's upstream source and adds an optional adapter for page links in managed Supernote transcripts. It supplies canonical source-line maps before pagination and validates links against the original transcript. Native Digest capture is not implemented. Reader logic and UI checks pass (**123/123** and **106/106**); page-link browser/integration checks pass **5/5**. Version 2.1.1 is active on the Nomad with all three installed artifact hashes matching approved files; MD Reader is absent on desktop Vedas. Live verification opened existing generated Markdown and rendered **19/19** enabled inline chips in 19 groups with no reader error. Reader settings/data were preserved, and all 14 saved reading positions were restored. No Notes launch or provider call occurred. See the parent plugin's private device evidence for activation and UI readback.
 
 Read your Obsidian notes — and your books — like an e-book.
 

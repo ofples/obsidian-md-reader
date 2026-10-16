@@ -19,7 +19,7 @@ The starting adaptation was compared with the installed reader and its original 
 
 ## Current integrations
 
-Version 2.1.1 implements the transcript rendering adapter below. Native Digest capture remains deferred. Version 2.1.1 is active on the Nomad with installed hashes matching the approved build; MD Reader is absent on desktop Vedas. Activation preserved reader settings and data. Bounded live UI checks are in progress; activation evidence is retained privately in the companion Nomad Transcripts workspace.
+Version 2.1.1 implements the transcript rendering adapter below. Native Digest capture remains deferred. Version 2.1.1 is active on the Nomad with installed hashes matching the approved build; MD Reader is absent on desktop Vedas. Activation preserved reader settings and data. Live verification opened generated Markdown and rendered 19/19 enabled chips across 19 groups without reader errors; all 14 saved reading positions were restored. Evidence is retained privately in the companion Nomad Transcripts workspace.
 
 ### Transcript reading — implemented in 2.1.1
 
@@ -37,7 +37,7 @@ Any possible Android bridge route is undocumented and remains an isolated feasib
 
 ## Verification boundary
 
-Installed-byte and activation checks confirm version 2.1.1 active on the Nomad. Bounded live UI verification is still in progress. Source tests and activation evidence do not establish provider quality or recognition behavior; no paid calls were made.
+Installed-byte, activation and bounded live UI checks confirm version 2.1.1 active and rendering correctly on the Nomad. Source tests and the reader UI check do not establish provider quality or recognition behavior; no paid calls were made.
 
 Current source checks:
 
@@ -45,6 +45,6 @@ Current source checks:
 - `node tests/logic.mjs`: **123/123** checks passed.
 - `node tests/ui.mjs`: **106/106** checks passed.
 - Page-link browser and integration checks: **5/5** passed in the companion plugin's isolated local fixtures.
-- Real provider recognition/cleanup quality and live Supernote verification: not exercised in this pass; no paid calls were made.
+- Real provider recognition/cleanup quality was not exercised in this pass; no paid calls were made.
 
 `origin` points to this fork; `upstream` points to the original project. Fork work is on `supernote-integration`; `main` retains the upstream baseline. No release tag or new install package was published during setup.
