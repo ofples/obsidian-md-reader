@@ -1,10 +1,10 @@
 # MD Reader
 
-> **Supernote working fork:** this fork preserves upstream MD Reader and adds local Supernote adaptations and a transcript page-link adapter. Native Digest integration remains deferred. See [FORK.md](FORK.md) for provenance, current behavior, and verification status.
+> **Supernote fork:** an adaptation of [upstream MD Reader](https://github.com/mrrepac/obsidian-md-reader) that preserves its e-book reader and adds optional integrations. See [FORK.md](FORK.md) for provenance and integration details.
 
-## Supernote fork version 2.1.1
+## Supernote fork version 2.1.2
 
-The fork preserves MD Reader's upstream source and adds an optional adapter for page links in managed Supernote transcripts. It supplies canonical source-line maps before pagination and validates links against the original transcript. Native Digest capture is not implemented. Reader logic and UI checks pass (**123/123** and **106/106**); page-link browser/integration checks pass **5/5**. Version 2.1.1 is active on the Nomad with all three installed artifact hashes matching approved files; MD Reader is absent on desktop Vedas. Live verification opened existing generated Markdown and rendered **19/19** enabled inline chips in 19 groups with no reader error. Reader settings/data were preserved, and all 14 saved reading positions were restored. No Notes launch or provider call occurred. See the parent plugin's private device evidence for activation and UI readback.
+Read Obsidian notes and books as paginated, horizontally flipping pages. This fork works on its own with any Obsidian theme; Paper and Sidebar are optional companions. It also supports inline page links for managed Supernote Transcripts when that plugin is installed and page links are enabled. Without Transcripts, MD Reader continues to render ordinary Markdown. See the [Nomad and desktop workflow](https://github.com/ofples/supernote-transcripts/blob/main/docs/workflow.md) for the complete setup. Native Supernote Digest capture remains deferred.
 
 Read your Obsidian notes — and your books — like an e-book.
 
@@ -152,18 +152,21 @@ Interface language follows Obsidian — English and Russian.
 
 ### From the Community Plugins catalog
 
-Settings → Community plugins → Browse → search **"MD Reader"** → Install → Enable.
+The Community Plugins catalog installs upstream MD Reader by mrrepac. It does not install this Supernote fork. Upstream MD Reader and this fork both use the plugin ID `md-reader`, so Obsidian can run only one of them in a vault at a time. Catalog updates target upstream and can replace the fork, so update this fork by replacing its files manually.
 
-If it is already installed, check for updates in Community plugins. Updating keeps
-your settings, saved positions and bookmarks.
+### Install this fork manually
 
-### Manual
+Download or clone this repository, then copy exactly these three plugin files into your vault's plugin folder:
 
-Copy `main.js`, `manifest.json` and `styles.css` into
-`<your vault>/.obsidian/plugins/md-reader/` and enable the plugin in
-Settings → Community plugins.
+```text
+main.js
+manifest.json
+styles.css
+```
 
-When updating manually, replace those three files and keep `data.json`.
+The folder is `<your vault>/.obsidian/plugins/md-reader/` (or the active configuration folder's `plugins/md-reader/`). In Obsidian, reload the app if needed, then enable **MD Reader** in Settings → Community plugins. When replacing an existing upstream installation, replace only those three files and preserve `data.json`; settings, reading positions and bookmarks use the same plugin ID and data format.
+
+To return to upstream, use the Community Plugins catalog after removing the fork files from that same `md-reader` folder. Do not install both copies side by side in one vault; Obsidian identifies them as the same plugin.
 
 ## Development
 

@@ -1,10 +1,10 @@
 # Supernote fork
 
-## 2.1.2 release preparation
+## Fork version 2.1.2
 
-This repository is the canonical reader source for standalone use and optional Paper distributions. Its existing accepted Paper reader adaptations were reconciled against Paper's generated 2.1.0 copy; that copy lacks this fork's transcript source mapping and adapter. Paper should consume a pinned artifact from here rather than maintain a second reader patch pipeline.
+This fork is the canonical maintained reader source for standalone use and optional Paper distributions. It works without a theme, Sidebar, or Supernote Transcripts. Paper distributions should consume a pinned artifact from here rather than maintain a second reader patch pipeline.
 
-The candidate adds a version-aware optional Transcripts adapter, normal Markdown fallback on unavailable/failed adapters, guarded optional Sidebar navigation and reader-owned base control styles. It keeps upstream font defaults and normal font fallbacks. See [integration boundaries](INTEGRATION.md) and [candidate notes](release-notes/2.1.2.md). Version 2.1.1 remains the last device-verified version; no candidate is installed by this preparation work.
+Version 2.1.2 adds a version-aware optional Transcripts adapter, normal Markdown fallback when the adapter is unavailable or fails, guarded optional Sidebar navigation, and reader-owned base control styles. It keeps upstream font defaults and normal font fallbacks. The plugin ID remains `md-reader`, so this fork and upstream are alternative installations in a vault. See [integration boundaries](INTEGRATION.md) and [2.1.2 release notes](release-notes/2.1.2.md).
 
 ## Provenance and license
 
@@ -25,9 +25,9 @@ The starting adaptation was compared with the installed reader and its original 
 
 ## Current integrations
 
-Version 2.1.1 implements the transcript rendering adapter below. Native Digest capture remains deferred. Version 2.1.1 is active on the Nomad with installed hashes matching the approved build; MD Reader is absent on desktop Vedas. Activation preserved reader settings and data. Live verification opened generated Markdown and rendered 19/19 enabled chips across 19 groups without reader errors; all 14 saved reading positions were restored. Evidence is retained privately in the companion Nomad Transcripts workspace.
+Version 2.1.2 implements the optional transcript rendering adapter below. Native Digest capture remains deferred. For Nomad and desktop setup, see the [Supernote Transcripts workflow](https://github.com/ofples/supernote-transcripts/blob/main/docs/workflow.md).
 
-### Transcript reading — implemented in 2.1.1
+### Transcript reading — implemented in 2.1.2
 
 MD Reader renders Markdown through Obsidian's `MarkdownRenderer`. The fork now retains source-line maps through frontmatter removal, footnote processing and chapter packing, and offers each normal/prefetched chapter to Supernote Transcripts' optional page-link adapter before pagination. The adapter validates markers against the canonical managed file. With no adapter, or when page links are disabled, ordinary Markdown rendering remains available. Native device paths are not embedded in the reader or transcript links.
 
@@ -43,14 +43,6 @@ Any possible Android bridge route is undocumented and remains an isolated feasib
 
 ## Verification boundary
 
-Installed-byte, activation and bounded live UI checks confirm version 2.1.1 active and rendering correctly on the Nomad. Source tests and the reader UI check do not establish provider quality or recognition behavior; no paid calls were made.
+Source and fixture checks exercise the adapter and its normal-Markdown fallback. They do not establish runtime behavior in every Obsidian version, theme, or companion-plugin combination. Device installation and live reader behavior are separate checks. No Native Digest capture or database modification is implemented.
 
-Current source checks:
-
-- `node --check main.js`: passed.
-- `node tests/logic.mjs`: **123/123** checks passed.
-- `node tests/ui.mjs`: **106/106** checks passed.
-- Page-link browser and integration checks: **5/5** passed in the companion plugin's isolated local fixtures.
-- Real provider recognition/cleanup quality was not exercised in this pass; no paid calls were made.
-
-`origin` points to this fork; `upstream` points to the original project. Fork work is on `supernote-integration`; `main` retains the upstream baseline. No release tag or new install package was published during setup.
+`origin` points to this fork; `upstream` points to the original project. The fork preserves upstream attribution, MIT licensing, source, tests, documentation, and release history.
