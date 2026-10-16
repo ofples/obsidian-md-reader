@@ -27,6 +27,8 @@ MD Reader currently renders Markdown through Obsidian's `MarkdownRenderer`, stri
 
 ### Native Digest capture
 
+Deferred by request: [enhancement #1](https://github.com/ofples/obsidian-md-reader/issues/1). Keep the KOReader highlight-to-Digest integration as a research lead. Native bridge implementation and experiments are outside the current reader/transcript work.
+
 The proposed capture should retain the selected quote, vault-relative source path, text anchor, nearby context, source revision, and optionally a stable original notebook/page identity. Its bridge should be independent from the reader, write only after an explicit user action, use a deduplication identifier, and report success only after receiving acknowledgement.
 
 The official [Plugin Doc API](https://docs.supernote.com/en/api-reference/supernote-plugin/plugin-doc-api/index) lists four document methods for reading document data and images. The [Plugin Note API](https://docs.supernote.com/en/api-reference/supernote-plugin/plugin-note-api/get-lasso-link) explicitly describes type 6 Digest links as read-only; `TextBox` `textDigestData` is not a documented central database create API. Supernote's [Digest user guide](https://support.supernote.com/the-revamped-digest-app) documents creating Digest entries in the native app. A documented plugin write route has not been established. Do not modify the native app database directly.
