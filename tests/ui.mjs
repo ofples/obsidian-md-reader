@@ -83,7 +83,12 @@ class SettingStub {
   addButton(cb) { cb(chain()); return this; }
 }
 class ModalStub {
-  constructor(app) { this.app = app; this.contentEl = new El(); this.titleEl = new El(); }
+  constructor(app) {
+    this.app = app;
+    this.modalEl = new El('div', 'modal');
+    this.titleEl = this.modalEl.createEl('h2', { cls: 'modal-title' });
+    this.contentEl = this.modalEl.createDiv('modal-content');
+  }
   open() { this.onOpen(); }
   close() { this.closed = true; }
 }

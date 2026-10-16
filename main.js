@@ -518,6 +518,7 @@ class LibraryModal extends Modal {
     const { contentEl } = this;
     // штатный заголовок модалки (titleEl есть во всех версиях API, в отличие от setTitle)
     this.titleEl.setText(t('libTitle'));
+    this.modalEl.addClass('sn-reader-settings');
     this.items = this.plugin.libraryFiles();
 
     // «Продолжить» — то, зачем библиотеку открывают чаще всего: вернуться в книгу
@@ -644,6 +645,7 @@ class AppearanceModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.addClass('hr-ap');
+    this.modalEl.addClass('sn-reader-settings');
     this.titleEl.setText(t('menuAppearance'));
     const p = this.plugin;
     const save = () => { p.saveAll(); p.refreshOpenViews(); };
@@ -682,6 +684,7 @@ class AppearanceModal extends Modal {
         cls: 'hr-ap-tint hr-ap-tint-' + name,
         attr: { 'aria-label': t(TINT_LABEL[name]) },
       });
+      b.setText(t(TINT_LABEL[name]));
       b.toggleClass('is-active', p.settings.tint === name);
       b.addEventListener('click', () => {
         p.settings.tint = name;
@@ -1264,6 +1267,41 @@ class ReaderView extends ItemView {
   }
 
   getViewType() { return VIEW_TYPE_READER; }
+  async waitForPaperFonts() {
+    const content = this.content;
+    if (!content?.isConnected) return;
+    const doc = content.ownerDocument;
+    const fonts = doc.fonts;
+    const style = doc.defaultView.getComputedStyle(content);
+    if (!fonts?.load || !style.fontFamily.includes('Supernote Literata')) return;
+    const sample = 'Aa ā ī ṛ ś ṣ ṇ ṃ';
+    const descriptors = ['400 ', 'italic 400 ', '700 ', 'italic 700 ']
+      .map(prefix => prefix + style.fontSize + ' "Supernote Literata"');
+    if (descriptors.every(font => fonts.check(font, sample))) return;
+    let timer;
+    try {
+      // Embedded local fonts usually resolve immediately. Bound the wait so
+      // a font error cannot prevent a note opening; loadingdone remeasures later.
+      await Promise.race([
+        Promise.all(descriptors.map(font => fonts.load(font, sample))),
+        new Promise(resolve => { timer = window.setTimeout(resolve, 2000); })
+      ]);
+    } catch (error) { console.warn('Supernote Reader font unavailable', error); }
+    finally { window.clearTimeout(timer); }
+  }
+  focus() { this.viewport?.focus({preventScroll:true}); }
+  cancelPaperGesture() { this._snAbortDrag?.(); this._lastTouch = Date.now(); }
+  togglePageIndicator() {
+    if (this.pageIndicator) this.pageIndicator.hidden = !this.pageIndicator.hidden;
+  }
+  handlePaperTap(clientX, clientY) {
+    const r = this.viewport.getBoundingClientRect();
+    const x = clientX - r.left, y = clientY - r.top;
+    if (x < r.width * 0.3) this.prev();
+    else if (x > r.width * 0.7) this.next();
+    else if (y >= r.height - 48) this.togglePageIndicator();
+    else if (y < 48) this.openNavMenu();
+  }
   getDisplayText() { return this.file ? this.file.basename : t('fallbackTitle'); }
   getIcon() { return 'book-open'; }
 
@@ -1285,6 +1323,9 @@ class ReaderView extends ItemView {
 
     const vp = this.contentEl.createDiv('hr-viewport');
     this.viewport = vp;
+    vp.classList.add('hr-hide-ui', 'sn-gesture-reader');
+    this.pageIndicator = vp.createDiv({cls:'sn-page-indicator',attr:{role:'status','aria-live':'polite'}});
+    this.pageIndicator.hidden = true;
     // official opt-out of Obsidian's mobile swipe recognizer:
     // it walks ancestors on touchstart and does not arm when it sees this attribute
     vp.dataset.ignoreSwipe = 'true';
@@ -1568,6 +1609,8 @@ class ReaderView extends ItemView {
       }
     });
 
+    await this.waitForPaperFonts();
+    if (gen !== this._renderGen || !this.content?.isConnected) return;
     this._raf = requestAnimationFrame(() => {
       this._raf = 0;
       if (gen !== this._renderGen || !this.content || !this.content.isConnected) return;
@@ -1848,7 +1891,10 @@ class ReaderView extends ItemView {
     } else if (this._pendingHeading) {
       // прыжок к заголовку (в т.ч. после загрузки главы из оглавления)
       const el = this.resolveHeadingEl(this._pendingHeading.index, this._pendingHeading.text);
-      if (el) this.page = this.pageOfRect(el.getBoundingClientRect());
+      if (el) {
+        this.page = this.pageOfRect(el.getBoundingClientRect());
+        this._readingAnchor = this.anchorForHeading(el) || this.captureAnchor();
+      }
       if (!mediaLoading) this._pendingHeading = null;
     } else if (this._pendingFraction) {
       // отложенное восстановление доли — только после реального замера,
@@ -1881,6 +1927,12 @@ class ReaderView extends ItemView {
   }
 
   goTo(p) {
+    // Explicit navigation supersedes any restoration queued by an earlier
+    // resize, keyboard or media load, even when the new page number is equal.
+    this._pendingAnchor = null;
+    this._pendingFraction = 0;
+    this._pendingHeading = null;
+    this._pendingFind = null;
     const np = Math.max(0, Math.min(p, this.totalPages - 1));
     if (np !== this.page) this._readingAnchor = null;
     if (np !== this.page) { this._selectedQuote = null; if (this.quoteButton) this.quoteButton.hidden = true; }
@@ -2155,6 +2207,8 @@ class ReaderView extends ItemView {
   // Читаешь свою заметку, видишь опечатку — и до сих пор её нечем было поправить:
   // приходилось искать файл руками. Открываем исходник на строке текущей главы
   openInEditor() {
+    const controls = this.app?.plugins?.plugins?.['supernote-sidebar'];
+    if (controls?.edit) { controls.edit(this.leaf); return; } // Use the same note tab and preserve the current passage.
     if (!this.file) return;
     const idx = this.currentTocIndex();
     const line = idx >= 0 && typeof this.toc[idx].line === 'number'
@@ -2166,8 +2220,54 @@ class ReaderView extends ItemView {
   }
 
   /* ---------- navigation menu (главная точка входа: тап по проценту) ---------- */
-  openNavMenu(evt) {
+  openNavMenu(evt = {clientX:window.innerWidth,clientY:0}) {
+    this.focus();
     const menu = new Menu();
+    this._snReaderMenuOpen = true;
+    let selected = false;
+    let closing = false;
+    const focusRef = this.app.workspace.on('active-leaf-change',active => {
+      if (!closing || active === this.leaf) return;
+      this.app.workspace.offref(focusRef);
+      if (!selected && this.leaf.parent && this.leaf.view === this &&
+          !['markdown',VIEW_TYPE_READER].includes(active?.view.getViewType())) {
+        this.app.workspace.setActiveLeaf(this.leaf,{focus:true});
+        this.focus();
+      }
+    });
+    const key = event => {if (event.key === 'Enter') selected = true;};
+    document.addEventListener('keydown',key,true);
+    menu.onHide(() => {
+      closing = true;
+      // Native workspace activation is debounced after menu dismissal.
+      window.setTimeout(() => this.app.workspace.offref(focusRef),250);
+      document.removeEventListener('keydown',key,true);
+      // Let native menu focus restoration and workspace activation finish.
+      window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+        this._snReaderMenuOpen = false;
+        // Native mobile menu dismissal may activate an old sidebar leaf.
+        // Keep intentional note/action navigation; restore only lost focus.
+        const active = this.app.workspace.activeLeaf;
+        if (!selected && this.leaf.parent && this.leaf.view === this &&
+            !['markdown',VIEW_TYPE_READER].includes(active?.view.getViewType())) {
+          this.app.workspace.setActiveLeaf(this.leaf,{focus:false});
+          this.focus();
+        }
+      }));
+    });
+    const panel = menu.dom;
+    if (panel) {
+      panel.addClass('sn-reader-menu');
+      // The native floating menu scrolls on mouse hover. In a fixed sheet this
+      // moves another action under the pointer between pointing and tapping.
+      panel.querySelector('.menu-scroll')?.addEventListener('mousemove',event=>event.stopImmediatePropagation(),true);
+      panel.addEventListener('click',event=>{if(event.target.closest('.menu-item'))selected=true;},true);
+      const header = panel.createDiv({cls:'sn-reader-menu-header'});
+      header.createSpan({text:'Reader menu'});
+      const close = header.createEl('button',{cls:'sn-reader-menu-close',text:'×',attr:{'aria-label':'Close reader menu'}});
+      close.addEventListener('click',event=>{event.stopPropagation();menu.hide();});
+      panel.insertBefore(header,panel.firstChild);
+    }
     const quote = this.selectedQuote() || this._selectedQuote;
     if (quote) menu.addItem((i) => i.setTitle(t('quoteSave')).setIcon('quote').onClick(() => this.saveSelectedQuote(quote)));
     menu.addItem((i) => i.setTitle(t('menuToc')).setIcon('list').onClick(() => this.openToc()));
@@ -2192,7 +2292,14 @@ class ReaderView extends ItemView {
       .setIcon(here ? 'bookmark-minus' : 'bookmark-plus')
       .onClick(() => this.toggleBookmark()));
     menu.addItem((i) => i.setTitle(t('menuBmList')).setIcon('bookmark').onClick(() => this.openBookmarks()));
-    if (Platform.isDesktop) {
+    const controls = this.app?.plugins?.plugins?.['supernote-sidebar'];
+    menu.addItem(i => i.setTitle('Go to start').setIcon('skip-back').onClick(() => this.goToBookEdge(0)));
+    if (controls?.toggleFullscreen) {
+      menu.addItem(i => i.setTitle('Read with scrolling').setIcon('book-open').onClick(() => controls.read(this.leaf,'scroll')));
+      menu.addSeparator();
+      menu.addItem(i => i.setTitle(controls.isFullscreen() ? 'Exit fullscreen reading' : 'Enter fullscreen reading')
+        .setIcon(controls.isFullscreen() ? 'minimize' : 'maximize').onClick(() => controls.toggleFullscreen()));
+    } else if (Platform.isDesktop) {
       menu.addSeparator();
       const doc = this.contentEl.ownerDocument;
       const fs = this.plugin.isFullscreen(doc);
@@ -2515,9 +2622,31 @@ class ReaderView extends ItemView {
     this.renderChapter(at.chapter, { fraction: at.within });
   }
 
+  anchorForHeading(el) {
+    const index = this.textIndex();
+    if (!el || !index || !index.text) return null;
+    // Locate the heading's first normalized character by DOM order, including
+    // formatted/repeated heading text without confusing an earlier occurrence.
+    let lo = 0, hi = index.text.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      const range = index.rangeAt(mid) || index.rangeAt(mid + 1);
+      if (range && !el.contains(range.startContainer) &&
+          (el.compareDocumentPosition(range.startContainer) & 2)) lo = mid + 1;
+      else hi = mid;
+    }
+    while (lo < index.text.length && (!index.rangeAt(lo) || index.text[lo] === ' ')) lo++;
+    const range = index.rangeAt(lo);
+    if (!range || !el.contains(range.startContainer)) return null;
+    return {v:1,quote:index.text.slice(lo,lo+96),prefix:index.text.slice(Math.max(0,lo-48),lo),
+      hint:((this.charsBefore[this.chapterIndex] || 0) + lo / index.text.length * this.chapterChars[this.chapterIndex]) / (this.totalChars || 1)};
+  }
+
   goToHeading(el) {
     if (!el || !this.content || !this.pageStride) return;
     this.goTo(this.pageOfRect(el.getBoundingClientRect()));
+    this._readingAnchor = this.anchorForHeading(el) || this.captureAnchor();
+    this.savePos();
   }
 
   // номер страницы, на которой лежит прямоугольник. Смещение в колоночном потоке =
@@ -2551,6 +2680,7 @@ class ReaderView extends ItemView {
       frac = (before + withinFrac * chars) / this.totalChars;
     }
     const pct = Math.round(frac * 100);
+    if (this.pageIndicator) this.pageIndicator.setText(multi ? pct + '%' : (this.page + 1) + ' / ' + this.totalPages + ' · ' + pct + '%');
     if (this._statusEls) {
       // книга (много блоков) — только общий % (номер блока — деталь реализации, не «глава»);
       // обычная заметка — как раньше, «страница / всего · %».
@@ -2633,7 +2763,7 @@ class ReaderView extends ItemView {
     // Let CSS resolve em against the actual content font. A theme can change
     // the inherited font between viewport and content, so converting through
     // the viewport font can under-reserve space for the status bar.
-    c.style.paddingBottom = `max(${padY + 0.6}em, ${barH + 4}px)`;
+    c.style.paddingBottom = padY + 'em'; // Ordinary page margin, no footer reserve.
     // выравнивание по ширине + переносы. Язык берём у САМОГО текста, а не у интерфейса:
     // от него зависят правила переноса, и книга не обязана быть на языке Obsidian
     c.classList.toggle('hr-justify', !!s.justify);
@@ -2762,6 +2892,11 @@ class ReaderView extends ItemView {
     this.ro.observe(this.viewport);
     // Footer height can change independently (fonts, wrapping, status text).
     if (this.statusBar) this.ro.observe(this.statusBar);
+    const paperFonts = this.content?.ownerDocument?.fonts;
+    if (paperFonts) this.registerDomEvent(paperFonts, 'loadingdone', () => {
+      if (this.content?.isConnected && this.content.ownerDocument.defaultView
+          .getComputedStyle(this.content).fontFamily.includes('Supernote Literata')) repaginate();
+    });
     this.registerEvent(this.app.workspace.on('css-change', repaginate));
     this.registerEvent(this.app.workspace.on('resize', repaginate));
   }
@@ -2789,6 +2924,10 @@ class ReaderView extends ItemView {
   // второй выходит из чтения совсем. Так «случайный Esc» ничего не теряет,
   // а выйти всё равно можно не глядя
   onEscape() {
+    if (this._snReaderMenuOpen || (typeof document !== 'undefined' && document.querySelector('.menu,.modal-container'))) return; // Dismiss overlays before acting on the note.
+    const controls = this.app?.plugins?.plugins?.['supernote-sidebar'];
+    if (controls && document.body.matches('.sn-left-open,.sn-right-open')) { controls.closeDrawers(); return; }
+    if (controls?.isFullscreen?.()) { controls.toggleFullscreen(); return; }
     if (this.closeFootnote(true)) return; // сначала закрыть открытую сноску
     if (this.chromeHidden()) { this.exitReadingChrome(); return; }
     if (this.plugin) this.plugin.exitReader(this.leaf);
@@ -2856,11 +2995,12 @@ class ReaderView extends ItemView {
     // is handled by data-ignore-swipe + capture-phase stopPropagation.
     const OS_EDGE = 12, SWIPE = 45, CLAIM = 6, TAP_MOVE = 10, TAP_MS = 300;
     let x0 = 0, y0 = 0, t0 = 0, dragging = false, decided = false, horizontal = false;
+    let bottomStart = false, menuSwipe = false;
     let pinch = null; // {d0, base} — щипок меняет размер шрифта, а не масштаб окна
 
     const abortDrag = () => {
       if (dragging) {
-        dragging = false; decided = false; horizontal = false;
+        dragging = false; decided = false; horizontal = false; bottomStart = false; menuSwipe = false;
         this.content.style.transition = this.plugin.settings.animate ? 'transform 0.2s ease' : 'none';
         this.applyTransform();
       }
@@ -2870,10 +3010,12 @@ class ReaderView extends ItemView {
       'a, input, button, textarea, select, [contenteditable], .task-list-item-checkbox, .callout-fold, .footnote-link, audio, video, .hr-ui, .hr-end, .hr-fn, .hr-fn-pop'
     ));
 
+    this._snAbortDrag = abortDrag;
     this.registerDomEvent(vp, 'touchstart', (e) => {
-      if (e.touches.length === 2) {
+      if (e.touches.length >= 2) {
         abortDrag();
-        pinch = { d0: touchDist(e.touches), base: this.plugin.settings.fontSize };
+        pinch = true; // Consume all multi-touch until every contact is released.
+        e.stopPropagation();
         return;
       }
       if (e.touches.length !== 1) { abortDrag(); return; }
@@ -2885,16 +3027,17 @@ class ReaderView extends ItemView {
       const win = (vp.ownerDocument && vp.ownerDocument.defaultView) || window;
       if (Math.min(tc.clientX, win.innerWidth - tc.clientX) < OS_EDGE) { abortDrag(); return; }
       x0 = tc.clientX; y0 = tc.clientY; t0 = Date.now();
-      dragging = true; decided = false; horizontal = false;
+      dragging = true; decided = false; horizontal = false; menuSwipe = false;
+      bottomStart = tc.clientY >= vp.getBoundingClientRect().bottom - 64 && !interactive(e.target);
       this.content.style.transition = 'none';
     }, { capture: true, passive: true });
 
     this.registerDomEvent(vp, 'touchmove', (e) => {
       if (pinch) {
-        if (e.touches.length < 2) return;
+        // Two-finger fullscreen taps belong to the companion plugin. Consume
+        // multi-touch here to prevent browser zoom and accidental page turns.
         e.stopPropagation();
         e.preventDefault();
-        if (pinch.d0 > 0) this.previewFontSize(pinch.base * (touchDist(e.touches) / pinch.d0));
         return;
       }
       if (!dragging) return;
@@ -2904,20 +3047,24 @@ class ReaderView extends ItemView {
       const dx = tc.clientX - x0, dy = tc.clientY - y0;
       if (!decided) {
         if (Math.abs(dx) < CLAIM && Math.abs(dy) < CLAIM) return;
-        if (Math.abs(dy) > Math.abs(dx)) { dragging = false; return; }
-        decided = true; horizontal = true;
+        if (Math.abs(dy) > Math.abs(dx)) {
+          if (!bottomStart || dy >= 0) { abortDrag(); return; }
+          decided = true; menuSwipe = true;
+        } else { decided = true; horizontal = true; }
       }
+      if (menuSwipe) { e.stopPropagation(); e.preventDefault(); return; }
       if (horizontal) {
         e.stopPropagation();
         e.preventDefault();
-        this.content.style.transform = 'translateX(' + (-this.page * this.pageStride + dx) + 'px)';
+        this.applyTransform(); // Supernote: no live page dragging on e-ink
       }
     }, { capture: true, passive: false });
 
     const endTouch = (e) => {
       if (pinch) {
-        // палец оторвали — жест кончился, теперь можно сохранить размер на диск
-        if (e.touches.length < 2) { pinch = null; this._lastTouch = Date.now(); this.plugin.commitFontSize(); }
+        // Keep the gesture consumed until every finger is lifted. Font size is
+        // controlled by Appearance and the reader settings, never by a pinch.
+        if (e.touches.length === 0) { pinch = null; this._lastTouch = Date.now(); }
         return;
       }
       if (!dragging) return;
@@ -2926,6 +3073,15 @@ class ReaderView extends ItemView {
       this.content.style.transition = this.plugin.settings.animate ? 'transform 0.2s ease' : 'none';
       const tc = e.changedTouches[0];
       const dx = tc.clientX - x0, dy = tc.clientY - y0, dt = Date.now() - t0;
+      const selection = vp.ownerDocument.getSelection();
+      if (selection && !selection.isCollapsed && this.content.contains(selection.anchorNode)) {
+        decided = false; horizontal = false; menuSwipe = false; this.applyTransform(); return;
+      }
+      if (menuSwipe) {
+        const open = dy <= -SWIPE && Math.abs(dy) > Math.abs(dx) * 1.5;
+        decided = false; horizontal = false; menuSwipe = false; bottomStart = false;
+        this.applyTransform(); if (open) this.openNavMenu(); return;
+      }
 
       if (Math.abs(dx) < TAP_MOVE && Math.abs(dy) < TAP_MOVE && dt < TAP_MS) {
         decided = false; horizontal = false;
@@ -2934,9 +3090,7 @@ class ReaderView extends ItemView {
         if (!this.plugin.settings.tapZones) { this.applyTransform(); return; }
         const r = vp.getBoundingClientRect();
         const x = tc.clientX - r.left, w = vp.clientWidth;
-        if (x < w * 0.3) this.prev();
-        else if (x > w * 0.7) this.next();
-        else this.toggleControls();
+        this.handlePaperTap(tc.clientX, tc.clientY);
         return;
       }
       if (horizontal && Math.abs(dx) >= SWIPE && Math.abs(dx) > Math.abs(dy) * 1.5) {
@@ -2965,9 +3119,7 @@ class ReaderView extends ItemView {
       if (sel && !sel.isCollapsed && sel.anchorNode && vp.contains(sel.anchorNode)) return;
       const r = vp.getBoundingClientRect();
       const x = e.clientX - r.left, w = vp.clientWidth;
-      if (x < w * 0.3) this.prev();
-      else if (x > w * 0.7) this.next();
-      else this.toggleControls();
+      this.handlePaperTap(e.clientX, e.clientY);
     });
 
     // A/D — то же самое, что стрелки. Ловим по e.code, а не через Scope по key:
@@ -4394,6 +4546,15 @@ class MdReaderPlugin extends Plugin {
   }
 
   async openReader(file) {
+    const controls = this.app?.plugins?.plugins?.['supernote-sidebar'];
+    const existing = controls?.findOpenFile?.(file.path);
+    if (existing) {
+      await existing.loadIfDeferred?.();
+      if (existing.view.getViewType() !== VIEW_TYPE_READER) await controls.read(existing,'pages');
+      await this.app.workspace.revealLeaf(existing);
+      this.app.workspace.setActiveLeaf(existing,{focus:true});
+      return;
+    }
     // заходим в книгу — значит заходим и в иммерсив, даже если в прошлый раз
     // хром был показан руками
     this._chromeShown = false;

@@ -1,5 +1,7 @@
 # MD Reader
 
+> **Supernote working fork:** this fork preserves upstream MD Reader and adds local Supernote adaptations. Planned transcript and native Digest integrations are not implemented yet. See [FORK.md](FORK.md) for provenance, current behavior, and integration status.
+
 Read your Obsidian notes — and your books — like an e-book.
 
 MD Reader renders a note into fixed-size **pages** and lets you flip through them **sideways** — by swiping, tapping the screen edges, or using the arrow keys — instead of scrolling vertically. Choose a single page or a two-page book spread. Works on **desktop and mobile**.

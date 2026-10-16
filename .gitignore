@@ -1,8 +1,28 @@
 # Per-user plugin data (reading positions & settings) — not part of the plugin
 data.json
+private/
+test-artifacts/
 
 # Tooling / OS
 node_modules/
 .DS_Store
 Thumbs.db
 *.log
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+local.properties
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Build output and caches (the plugin itself has no build step)
+build/
+dist/
+.gradle/
