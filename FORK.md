@@ -25,7 +25,7 @@ The starting adaptation was compared with the installed reader and its original 
 
 ## Current integrations
 
-Version 2.1.2 implements the optional transcript rendering adapter below. Native Digest capture remains deferred. For Nomad and desktop setup, see the [Supernote Transcripts workflow](https://github.com/ofples/supernote-transcripts/blob/main/docs/workflow.md).
+Version 2.1.2 implements the optional transcript rendering adapter below. Native Digest capture is under feasibility investigation and is not implemented. For Nomad and desktop setup, see the [Supernote Transcripts workflow](https://github.com/ofples/supernote-transcripts/blob/main/docs/workflow.md).
 
 ### Transcript reading — implemented in 2.1.2
 
@@ -33,7 +33,7 @@ MD Reader renders Markdown through Obsidian's `MarkdownRenderer`. The fork now r
 
 ### Native Digest capture
 
-Deferred by request: [enhancement #1](https://github.com/ofples/obsidian-md-reader/issues/1). Keep the KOReader highlight-to-Digest integration as a research lead. Native bridge implementation and experiments are outside the current reader/transcript work.
+Feasibility research resumed on 17 October 2026: [enhancement #1](https://github.com/ofples/obsidian-md-reader/issues/1), [research findings](docs/native-digests.md). Static inspection found an exported Android Knowledge provider and a candidate insert route with a NOTE source type. Native bridge implementation and provider behavior remain unverified; no Digest records were changed. The KOReader harmonizer uses a self-hosted cloud database and does not establish exact-position navigation.
 
 The proposed capture should retain the selected quote, vault-relative source path, text anchor, nearby context, source revision, and optionally a stable original notebook/page identity. Its bridge should be independent from the reader, write only after an explicit user action, use a deduplication identifier, and report success only after receiving acknowledgement.
 
