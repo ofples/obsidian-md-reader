@@ -495,6 +495,7 @@
 }
 .hr-reader-tools > button:focus-visible { outline: 2px solid var(--interactive-accent); outline-offset: 2px; }
 .hr-reader-tools > .hr-reader-quote[hidden] { display: none; }
+.hr-reader-tools > .hr-reader-digest[hidden] { display: none; }
 /* Reading indicators can be hidden independently. Menu and appearance stay
    available even with every progress indicator turned off. */
 .hr-viewport.hr-no-progress .hr-scrub,

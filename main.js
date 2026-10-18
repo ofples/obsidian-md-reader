@@ -59,6 +59,144 @@ const READING_FONTS = {
 const TINTS = ['sepia', 'cream', 'gray', 'night'];
 const TINT_LABEL = { none: 'optTintNone', sepia: 'optTintSepia', cream: 'optTintCream', gray: 'optTintGray', night: 'optTintNight' };
 
+const DIGEST_TEXT_LIMIT = 15000;
+const DIGEST_JSON_LIMIT = 40000;
+const DIGEST_URI_LIMIT = 150000;
+const DIGEST_REQUEST_RE = /^[a-f0-9]{64}$/;
+const DIGEST_RESULT_ACTION = 'md-reader-digest-result';
+const DIGEST_IGNORE_SELECTOR = '.st-page-link,.st-digest-anchor,button,[role="button"],.hr-ui,[data-selection-ignore]';
+
+function digestSelectionText(range) {
+  if (!range || typeof range.cloneContents !== 'function') return '';
+  const fragment = range.cloneContents();
+  for (const el of Array.from(fragment.querySelectorAll?.(DIGEST_IGNORE_SELECTOR) || [])) el.remove();
+  const blockTags = new Set(['ADDRESS','ARTICLE','ASIDE','BLOCKQUOTE','DD','DIV','DL','DT','FIGCAPTION','FIGURE',
+    'FOOTER','H1','H2','H3','H4','H5','H6','HEADER','LI','MAIN','OL','P','PRE','SECTION','TABLE','TR','UL']);
+  let out = '';
+  const walk = (node) => {
+    if (node.nodeType === 3) { out += node.nodeValue || ''; return; }
+    if (node.nodeType !== 1 && node.nodeType !== 11) return;
+    if (node.nodeType === 1 && node.matches?.(DIGEST_IGNORE_SELECTOR)) return;
+    if (node.nodeType === 1 && node.tagName === 'BR') {
+      if (out && !out.endsWith('\n')) out += '\n';
+      return;
+    }
+    const block = node.nodeType === 1 && blockTags.has(node.tagName);
+    const cell = node.nodeType === 1 && (node.tagName === 'TD' || node.tagName === 'TH');
+    if (block && out && !out.endsWith('\n')) out += '\n';
+    if (cell && out && !/[\t\n]$/.test(out)) out += '\t';
+    for (const child of Array.from(node.childNodes || [])) walk(child);
+    if (cell && out && !/[\t\n]$/.test(out)) out += '\t';
+    if (block && out && !out.endsWith('\n')) out += '\n';
+  };
+  walk(fragment);
+  return out.replace(/[\t\f\v ]+\n/g, '\n').replace(/\n[\t\f\v ]+/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function normalizeDigestField(value, limit, edge = 'start') {
+  let text = String(value || '').replace(/[\u0000-\u001f\u007f-\u009f\s]+/gu, ' ').trim();
+  if (edge === 'end' && text.length > limit) text = text.slice(-limit);
+  else if (text.length > limit) text = text.slice(0, limit);
+  if (text.length && /[\uDC00-\uDFFF]/.test(text[0])) text = text.slice(1);
+  if (text.length && /[\uD800-\uDBFF]/.test(text[text.length - 1])) text = text.slice(0, -1);
+  return text;
+}
+
+function digestRangeContext(root, range) {
+  if (!root || !range || typeof range.cloneRange !== 'function') return { before: '', after: '' };
+  try {
+    const before = range.cloneRange();
+    before.setStart(root, 0);
+    before.setEnd(range.startContainer, range.startOffset);
+    const after = range.cloneRange();
+    after.setStart(range.endContainer, range.endOffset);
+    after.setEnd(root, root.childNodes.length);
+    return {
+      before: digestSelectionText(before).slice(-240),
+      after: digestSelectionText(after).slice(0, 240),
+    };
+  } catch (_) { return { before: '', after: '' }; }
+}
+
+function digestSafeVaultPath(path) {
+  return typeof path === 'string' && path.length > 0 && path.length <= 2048 &&
+    !path.startsWith('/') && !path.includes('\\') && !path.includes(':') && !/[\u0000-\u001f\u007f]/.test(path) &&
+    path.toLowerCase().endsWith('.md') && path.split('/').every((part) => part && part !== '.' && part !== '..');
+}
+
+function digestVaultName(app) {
+  const value = typeof app?.vault?.getName === 'function' ? app.vault.getName() : app?.vault?.name;
+  const name = typeof value === 'string' ? value.trim() : '';
+  return name && name.length <= 256 ? name : '';
+}
+
+function digestIsAndroid() { return Platform.isAndroidApp === true || Platform.isAndroid === true; }
+
+function digestStoreKey(vault) { return 'md-reader-digest-v1:' + encodeURIComponent(vault); }
+
+function readDigestState(vault, storage) {
+  try {
+    const raw = storage?.getItem(digestStoreKey(vault));
+    const value = raw ? JSON.parse(raw) : null;
+    if (!value || value.version !== 1 || !value.requests || typeof value.requests !== 'object' || Array.isArray(value.requests)) {
+      return { version: 1, requests: {} };
+    }
+    const requests = {};
+    for (const [id, status] of Object.entries(value.requests)) {
+      if (DIGEST_REQUEST_RE.test(id) && ['pending','saved','uncertain','cancelled'].includes(status)) requests[id] = status;
+    }
+    return { version: 1, requests };
+  } catch (_) { return { version: 1, requests: {} }; }
+}
+
+function writeDigestState(vault, storage, state) {
+  try { storage?.setItem(digestStoreKey(vault), JSON.stringify(state)); return !!storage; }
+  catch (_) { return false; }
+}
+
+function validateDigestResult(params) {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) return null;
+  const keys = Object.keys(params);
+  if (keys.some((key) => !['action','vault','request','status','id'].includes(key)) ||
+      (params.action !== undefined && params.action !== DIGEST_RESULT_ACTION) ||
+      !keys.includes('vault') || typeof params.vault !== 'string' || !params.vault || params.vault.length > 256 ||
+      !keys.includes('request') || typeof params.request !== 'string' || !keys.includes('status') || !DIGEST_REQUEST_RE.test(params.request) ||
+      !['saved','uncertain','cancelled'].includes(params.status)) return null;
+  if (params.status === 'saved') {
+    if (!keys.includes('id') || typeof params.id !== 'string' || !/^[1-9]\d{0,15}$/.test(params.id) || !Number.isSafeInteger(Number(params.id))) return null;
+  } else if (keys.includes('id')) return null;
+  return { vault: params.vault, requestId: params.request, status: params.status, id: params.status === 'saved' ? Number(params.id) : null };
+}
+
+function validateDigestNote(note) {
+  if (!note || typeof note !== 'object' || Array.isArray(note)) return null;
+  const keys = Object.keys(note);
+  if (keys.some((key) => !['path','page','pageId','pageIds','fileId'].includes(key)) ||
+      typeof note.path !== 'string' || note.path.length > 4096 || !note.path.startsWith('/storage/emulated/0/Note/') ||
+      !note.path.endsWith('.note') || note.path.includes('\\') || /%(?:2f|5c)/i.test(note.path) || /[\u0000-\u001f\u007f-\u009f]/.test(note.path) ||
+      /%25(?:2f|5c)/i.test(note.path) || note.path.includes(':') ||
+      note.path.split('/').slice(1).some((part) => !part || part === '.' || part === '..') ||
+      !Number.isInteger(note.page) || note.page < 1 || note.page > 100000 ||
+      typeof note.pageId !== 'string' || note.pageId.length < 8 || note.pageId.length > 256 || !note.pageId.startsWith('native:') || /[\u0000-\u001f\u007f-\u009f]/.test(note.pageId) ||
+      !Array.isArray(note.pageIds) || note.pageIds.length < 1 || note.pageIds.length > 100 ||
+      note.pageIds[0] !== note.pageId || note.pageIds.some((id) => typeof id !== 'string' || id.length < 8 || id.length > 256 || !id.startsWith('native:') || /[\u0000-\u001f\u007f-\u009f]/.test(id)) ||
+      typeof note.fileId !== 'string' || !note.fileId || note.fileId.length > 256 || /[\u0000-\u001f\u007f-\u009f]/.test(note.fileId) ||
+      new Set(note.pageIds).size !== note.pageIds.length) return null;
+  return { path: note.path, page: note.page, pageId: note.pageId, pageIds: [...note.pageIds], fileId: note.fileId };
+}
+
+async function digestRequestId(identity) {
+  const canonical = JSON.stringify({ text: identity.text, origin: identity.origin, note: identity.note || null });
+  let bytes;
+  if (globalThis.crypto?.subtle?.digest) {
+    bytes = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
+  } else {
+    const crypto = require('crypto');
+    bytes = crypto.createHash('sha256').update(canonical, 'utf8').digest();
+  }
+  return Array.from(new Uint8Array(bytes)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 // Presets only change appearance. Library, reading positions and behaviour stay intact.
 const APPEARANCE_KEYS = ['fontSize', 'fontFamily', 'fontFamilyCustom', 'tint', 'brightness',
   'lineHeight', 'pageMode', 'maxPageWidth', 'columnGap', 'verticalPadding', 'horizontalPadding', 'justify'];
@@ -1425,6 +1563,14 @@ class ReaderView extends ItemView {
     // Preserve the browser selection when a mouse click focuses the button.
     this.registerDomEvent(this.quoteButton, 'mousedown', (e) => e.preventDefault());
     this.registerDomEvent(this.quoteButton, 'click', (e) => { e.stopPropagation(); this.saveSelectedQuote(); });
+    if (digestIsAndroid()) {
+      this.digestButton = tools.createEl('button', { cls: 'hr-reader-digest', text: 'Digest', attr: {
+        'aria-label': 'Save to Supernote Digest', title: 'Save to Supernote Digest',
+      } });
+      this.digestButton.hidden = true;
+      this.registerDomEvent(this.digestButton, 'mousedown', (e) => e.preventDefault());
+      this.registerDomEvent(this.digestButton, 'click', (e) => { e.stopPropagation(); this.saveSelectedDigest(); });
+    }
     this.setupQuoteSelection();
     this.registerDomEvent(menuButton, 'click', (e) => {
       e.stopPropagation();
@@ -1585,15 +1731,29 @@ class ReaderView extends ItemView {
   async renderChapterMarkdown(index, markdown, target, component) {
     const pageLinks = this.app?.plugins?.plugins?.['nomad-transcripts']?.pageLinks;
     const compatible = pageLinks && (pageLinks.apiVersion === undefined || pageLinks.apiVersion === 1);
+    const canResolveSelection = pageLinks?.apiVersion === 1 &&
+      (pageLinks.capabilities?.includes?.('selectionProvenance') || pageLinks.capabilities?.selectionProvenance === true) &&
+      typeof pageLinks.selectionSource === 'function';
+    this._digestSelectionResolver = canResolveSelection ? pageLinks.selectionSource.bind(pageLinks) : null;
+    let linksEnabled = false;
+    if (compatible && typeof pageLinks.enabled === 'function') {
+      try { linksEnabled = !!pageLinks.enabled(); }
+      catch (e) {
+        console.warn('MD Reader: page-link state could not be read', e);
+        while (target?.firstChild) target.removeChild(target.firstChild);
+      }
+    }
     if (compatible && typeof pageLinks.enabled === 'function' && typeof pageLinks.renderSection === 'function' &&
+        (linksEnabled || canResolveSelection) &&
         this.file && Array.isArray(this.chapterSourceLineMaps?.[index])) {
       try {
-        if (pageLinks.enabled() && await pageLinks.renderSection({
+        if (await pageLinks.renderSection({
           element: target,
           sourcePath: this.file.path,
           markdown,
           sourceLineMap: this.chapterSourceLineMaps[index],
           component,
+          selectionProvenance: true,
         })) return;
         // A declined adapter may have written some nodes before returning false.
         while (target.firstChild) target.removeChild(target.firstChild);
@@ -1630,7 +1790,9 @@ class ReaderView extends ItemView {
     this._anchorIndex = null;
     this._readingAnchor = null;
     this._selectedQuote = null;
+    this._digestSelection = null;
     if (this.quoteButton) this.quoteButton.hidden = true;
+    if (this.digestButton) this.digestButton.hidden = true;
     this.content.style.transform = 'translateX(0px)';
     this.page = 0;
     this._measured = false;
@@ -2011,7 +2173,12 @@ class ReaderView extends ItemView {
     this._pendingFind = null;
     const np = Math.max(0, Math.min(p, this.totalPages - 1));
     if (np !== this.page) this._readingAnchor = null;
-    if (np !== this.page) { this._selectedQuote = null; if (this.quoteButton) this.quoteButton.hidden = true; }
+    if (np !== this.page) {
+      this._selectedQuote = null;
+      this._digestSelection = null;
+      if (this.quoteButton) this.quoteButton.hidden = true;
+      if (this.digestButton) this.digestButton.hidden = true;
+    }
     // сноска относится к странице: перелистнули — закрыли; пересчёт той же страницы
     // (поворот, новый размер шрифта) — только переставили к её маркеру
     if (np !== this.page) this.closeFootnote();
@@ -2361,8 +2528,14 @@ class ReaderView extends ItemView {
       close.addEventListener('click',event=>{event.stopPropagation();menu.hide();});
       panel.insertBefore(header,panel.firstChild);
     }
-    const quote = this.selectedQuote() || this._selectedQuote;
-    if (quote) menu.addItem((i) => i.setTitle(t('quoteSave')).setIcon('quote').onClick(() => this.saveSelectedQuote(quote)));
+    const liveQuote = this.selectedQuote();
+    const quote = liveQuote || this._selectedQuote;
+    if (quote) {
+      if (liveQuote) { this._selectedQuote = liveQuote; this._digestSelection = liveQuote; }
+      menu.addItem((i) => i.setTitle(t('quoteSave')).setIcon('quote').onClick(() => this.saveSelectedQuote(quote)));
+      if (digestIsAndroid()) menu.addItem((i) => i.setTitle('Save to Supernote Digest').setIcon('bookmark-plus')
+        .onClick(() => this.saveSelectedDigest(this._digestSelection)));
+    }
     menu.addItem((i) => i.setTitle(t('menuToc')).setIcon('list').onClick(() => this.openToc()));
     menu.addItem((i) => i.setTitle(t('menuSearch')).setIcon('search').onClick(() => this.openSearch()));
     if (this.toc && this.toc.length) {
@@ -2419,7 +2592,8 @@ class ReaderView extends ItemView {
     if (!selection || selection.isCollapsed || !selection.rangeCount) return null;
     const range = selection.getRangeAt(0);
     if (!this.content.contains(range.startContainer) || !this.content.contains(range.endContainer)) return null;
-    const text = selection.toString().trim();
+    const rangeSnapshot = range.cloneRange();
+    const text = digestSelectionText(rangeSnapshot);
     if (!text) return null;
     // Use the heading preceding the selection, not the last heading on the
     // page: several short sections can share a single spread.
@@ -2430,7 +2604,8 @@ class ReaderView extends ItemView {
       const el = this.resolveHeadingEl(entry.hIndex, entry.text);
       if (el && (range.comparePoint(el, 0) < 0 || el.contains(range.startContainer))) heading = entry.text;
     }
-    return { file: this.file, text, heading };
+    return { file: this.file, text, heading, range: rangeSnapshot, renderGen: this._renderGen,
+      sourcePath: this.file.path, sourceMtime: this.file.stat?.mtime };
   }
 
   setupQuoteSelection() {
@@ -2440,18 +2615,25 @@ class ReaderView extends ItemView {
       const selection = doc.getSelection();
       if (quote) {
         this._selectedQuote = quote;
+        this._digestSelection = quote;
         this.viewport.classList.remove('hr-hide-ui');
       } else if (selection && ((!selection.isCollapsed) || this.content.contains(selection.anchorNode))) {
         this._selectedQuote = null;
+        this._digestSelection = null;
       }
       if (this.quoteButton) this.quoteButton.hidden = !this._selectedQuote;
+      if (this.digestButton) this.digestButton.hidden = !this._digestSelection;
     });
     this.registerDomEvent(this.content, 'contextmenu', (event) => {
       const quote = this.selectedQuote();
       if (!quote) return;
+      this._selectedQuote = quote;
+      this._digestSelection = quote;
       event.preventDefault(); event.stopPropagation();
       const menu = new Menu();
       menu.addItem((i) => i.setTitle(t('quoteSave')).setIcon('quote').onClick(() => this.saveSelectedQuote(quote)));
+      if (digestIsAndroid()) menu.addItem((i) => i.setTitle('Save to Supernote Digest').setIcon('bookmark-plus')
+        .onClick(() => this.saveSelectedDigest(this._digestSelection)));
       menu.addItem((i) => i.setTitle(t('quoteCopy')).setIcon('copy').onClick(() => {
         doc.defaultView.navigator.clipboard.writeText(quote.text).catch((error) => console.error('MD Reader: copy failed', error));
       }));
@@ -2469,6 +2651,140 @@ class ReaderView extends ItemView {
     } catch (error) {
       console.error('MD Reader: quote could not be saved', error);
       new Notice(t('quoteFailed'));
+      return null;
+    }
+  }
+
+  async isManagedTranscript() {
+    if (typeof this.app?.vault?.cachedRead !== 'function' || !this.file) throw new Error('Current Markdown source is unavailable');
+    const source = await this.app.vault.cachedRead(this.file);
+    const header = String(source).match(/^---\r?\n([\s\S]{0,8192}?)\r?\n---(?:\r?\n|$)/);
+    return !!header && /^nomad_transcripts:\s*true\s*$/m.test(header[1]);
+  }
+
+  digestNotice(message) { new Notice(message); }
+
+  async saveSelectedDigest(snapshot) {
+    if (!digestIsAndroid()) return null;
+    if (this._digestPreparing) return null;
+    this._digestPreparing = true;
+    if (this.digestButton) this.digestButton.disabled = true;
+    try {
+      this.digestNotice('Preparing excerpt…');
+      return await this.prepareSelectedDigest(snapshot);
+    }
+    catch (error) {
+      console.error('MD Reader: Digest preparation failed', error);
+      this.digestNotice('Could not prepare this Digest request. Refresh the selection and try again.');
+      return null;
+    } finally {
+      this._digestPreparing = false;
+      if (this.digestButton) this.digestButton.disabled = false;
+    }
+  }
+
+  async prepareSelectedDigest(snapshot) {
+    const selected = snapshot || this._digestSelection;
+    const isCurrent = () => !!selected && selected === this._digestSelection && selected.file === this.file &&
+      selected.sourcePath === this.file?.path && selected.sourceMtime === this.file?.stat?.mtime &&
+      selected.renderGen === this._renderGen && selected.range && !selected.range.collapsed &&
+      typeof this.content?.contains === 'function' && this.content.contains(selected.range.startContainer) &&
+      this.content.contains(selected.range.endContainer);
+    if (!isCurrent()) { this.digestNotice('Select text in the current Reader chapter first.'); return null; }
+    let managed;
+    try { managed = await this.isManagedTranscript(); }
+    catch (error) {
+      console.warn('MD Reader: Digest transcript status could not be read', error);
+      this.digestNotice('Could not read the current Markdown source. Refresh the Reader and try again.'); return null;
+    }
+    if (!isCurrent()) { this.digestNotice('The Reader source changed while checking transcript provenance. Select the text again.'); return null; }
+    const resolver = this._digestSelectionResolver;
+    if (managed && !resolver) {
+      this.digestNotice('Enable or update Supernote Transcripts to link this excerpt to its notebook.');
+      return null;
+    }
+    const vault = digestVaultName(this.app);
+    if (!vault) { this.digestNotice('Could not identify this vault. Open the Reader from an Obsidian vault and try again.'); return null; }
+    if (!digestSafeVaultPath(selected.sourcePath)) { this.digestNotice('This Markdown path cannot be saved as Digest provenance.'); return null; }
+    if (selected.text.length < 1 || selected.text.length > DIGEST_TEXT_LIMIT) {
+      this.digestNotice('Select between 1 and 15,000 characters for a Supernote Digest.'); return null;
+    }
+    const origin = { vault, file: selected.sourcePath };
+    const heading = normalizeDigestField(selected.heading, 256);
+    if (heading) origin.heading = heading;
+    const context = digestRangeContext(this.content, selected.range);
+    const before = normalizeDigestField(context.before, 240, 'end');
+    const after = normalizeDigestField(context.after, 240);
+    if (before) origin.before = before;
+    if (after) origin.after = after;
+    let note = null;
+    if (resolver) {
+      try {
+        note = await resolver({ element: this.content, sourcePath: selected.sourcePath, range: selected.range.cloneRange() });
+      } catch (error) {
+        console.warn('MD Reader: Digest source lookup failed', error);
+        if (managed) { this.digestNotice('Could not resolve the transcript page for this selection. Refresh the chapter and try again.'); return null; }
+      }
+      if (!isCurrent()) { this.digestNotice('The selection changed while its source page was being resolved. Select it again.'); return null; }
+      if (note) {
+        note = validateDigestNote(note);
+        if (!note) {
+          if (managed) this.digestNotice('The transcript returned invalid page provenance. Update Supernote Transcripts and try again.');
+          else this.digestNotice('The selected source page could not be validated. Try again or use ordinary Markdown.');
+          return null;
+        }
+      } else if (managed) {
+        this.digestNotice('No source page matched this transcript selection. Refresh the chapter and try again.');
+        return null;
+      }
+    } else if (managed) {
+      this.digestNotice('Enable or update Supernote Transcripts to link this excerpt to its notebook.');
+      return null;
+    }
+    if (!isCurrent()) { this.digestNotice('The Reader source changed before Digest handoff. Select the text again.'); return null; }
+    const payload = { version: 1, requestId: '', text: selected.text, origin };
+    if (note) payload.note = note;
+    let json;
+    try {
+      payload.requestId = await digestRequestId(payload);
+      if (!isCurrent()) { this.digestNotice('The selection changed before Digest handoff. Select it again.'); return null; }
+      json = JSON.stringify(payload);
+    } catch (error) {
+      console.error('MD Reader: Digest request could not be prepared', error);
+      this.digestNotice('Could not prepare the Digest request on this device.'); return null;
+    }
+    if (json.length > DIGEST_JSON_LIMIT) { this.digestNotice('This Digest request is too large. Select a shorter passage.'); return null; }
+    const uri = 'supernote-bridge://digest?payload=' + encodeURIComponent(json);
+    if (uri.length > DIGEST_URI_LIMIT) { this.digestNotice('This Digest request is too large to open. Select a shorter passage.'); return null; }
+    let storage;
+    try { storage = window.localStorage; } catch (_) { storage = null; }
+    const state = readDigestState(vault, storage);
+    const existingStatus = state.requests[payload.requestId];
+    if (existingStatus === 'saved') {
+      try {
+        this.digestNotice('Opening saved Digest in Bridge.');
+        window.open(uri, '_blank');
+        return payload.requestId;
+      } catch (error) {
+        console.warn('MD Reader: saved Digest could not be reopened in Supernote Bridge', error);
+        this.digestNotice('Could not reopen this saved Digest in Supernote Bridge. Open Bridge and check the Digest list.');
+        return null;
+      }
+    }
+    if (existingStatus === 'uncertain') {
+      this.digestNotice('Check Supernote Digests before retrying this uncertain request.'); return null;
+    }
+    state.requests[payload.requestId] = 'pending';
+    if (!writeDigestState(vault, storage, state)) {
+      this.digestNotice('Reader could not save the local Digest request state. Enable local storage and try again.'); return null;
+    }
+    try {
+      window.open(uri, '_blank');
+      this.digestNotice('Review and save in Supernote Bridge. Reader will report success only after Bridge confirms it.');
+      return payload.requestId;
+    } catch (error) {
+      console.warn('MD Reader: Supernote Bridge could not be opened', error);
+      this.digestNotice('Supernote Bridge did not open. Install or update it, then retry this selection.');
       return null;
     }
   }
@@ -4478,6 +4794,10 @@ class MdReaderPlugin extends Plugin {
     // сериализовало всю базу позиций впустую — даже когда ридер закрыт
     this._dirty = false;
 
+    if (typeof this.registerObsidianProtocolHandler === 'function') {
+      this.registerObsidianProtocolHandler(DIGEST_RESULT_ACTION, (params) => this.handleDigestResult(params));
+    }
+
     this.registerView(VIEW_TYPE_READER, (leaf) => new ReaderView(leaf, this));
 
     // единственная ribbon-кнопка: открывает библиотеку (книги + импорт + добавление заметок)
@@ -4600,6 +4920,10 @@ class MdReaderPlugin extends Plugin {
           v.chapters = null;
           v.chapterSourceLineMaps = [];
           v.toc = [];
+          v._selectedQuote = null;
+          v._digestSelection = null;
+          if (v.quoteButton) v.quoteButton.hidden = true;
+          if (v.digestButton) v.digestButton.hidden = true;
           if (v.clearCache) v.clearCache();
           if (v.content) { v.content.empty(); v.content.createDiv('hr-empty').setText(t('notFound')); }
         }
@@ -4612,6 +4936,28 @@ class MdReaderPlugin extends Plugin {
       const s = JSON.stringify(this.dataBlob());
       if (s !== this.lastSaved) { this.saveData(JSON.parse(s)); this.lastSaved = s; }
     }, 2000));
+  }
+
+  handleDigestResult(params) {
+    try {
+      const result = validateDigestResult(params);
+      if (!result) return false;
+      const vault = digestVaultName(this.app);
+      if (!vault || result.vault !== vault) return false;
+      let storage;
+      try { storage = window.localStorage; } catch (_) { storage = null; }
+      const state = readDigestState(vault, storage);
+      if (state.requests[result.requestId] !== 'pending') return false;
+      state.requests[result.requestId] = result.status;
+      if (!writeDigestState(vault, storage, state)) return false;
+      if (result.status === 'saved') new Notice('Supernote Bridge confirmed Digest #' + result.id + '.');
+      else if (result.status === 'uncertain') new Notice('Bridge could not confirm this Digest. Check Supernote Digests before retrying.');
+      else new Notice('Digest capture was cancelled. Select the passage again to retry.');
+      return true;
+    } catch (error) {
+      console.warn('MD Reader: Digest callback could not be handled', error);
+      return false;
+    }
   }
 
   // Optional cross-plugin hook used by Nomad Transcripts when its page-link

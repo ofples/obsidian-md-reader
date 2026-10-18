@@ -2,15 +2,19 @@
 
 > **Supernote fork:** an adaptation of [upstream MD Reader](https://github.com/mrrepac/obsidian-md-reader) that preserves its e-book reader and adds optional integrations. See [FORK.md](FORK.md) for provenance and integration details.
 
-## Supernote fork version 2.1.2
+## Supernote fork version 2.1.3
 
-Read Obsidian notes and books as paginated, horizontally flipping pages. This fork works on its own with any Obsidian theme; Paper and Sidebar are optional companions. It also supports inline page links for managed Supernote Transcripts when that plugin is installed and page links are enabled. Without Transcripts, MD Reader continues to render ordinary Markdown. See the [Nomad and desktop workflow](https://github.com/ofples/supernote-transcripts/blob/main/docs/workflow.md) for the complete setup. Native Supernote Digest capture remains deferred.
+Read Obsidian notes and books as paginated, horizontally flipping pages. This fork works on its own with any Obsidian theme; Paper and Sidebar are optional companions. It supports inline page links and selection provenance for managed Supernote Transcripts, while ordinary Markdown remains independent of Transcripts. On Android, send selected text to Supernote Bridge for a confirmed Digest save. See [integration details](INTEGRATION.md) and the [Nomad and desktop workflow](https://github.com/ofples/supernote-transcripts/blob/main/docs/workflow.md).
 
 Read your Obsidian notes — and your books — like an e-book.
 
 MD Reader renders a note into fixed-size **pages** and lets you flip through them **sideways** — by swiping, tapping the screen edges, or using the arrow keys — instead of scrolling vertically. Choose a single page or a two-page book spread. Works on **desktop and mobile**.
 
 It also **imports FB2, EPUB and TXT books into Markdown**, so a whole library lives inside your vault as ordinary notes you can link, quote and search like anything else.
+
+### Save a passage to Supernote Digest
+
+On a compatible Supernote, select a passage and choose **Save to Supernote Digest** from the Reader menu or selected-text toolbar. Review it in Supernote Bridge, tap **Save Digest**, then return to Obsidian for confirmation. Ordinary Markdown works without Transcripts and retains its file and quote context. Managed transcripts require Transcripts 0.15 and a matching local mirror. Bridge can open the original notebook after saving; the native Digest app's own jump-back action is unsupported. See [setup and limits](docs/native-digests.md).
 
 ## Fixed in 2.0.3
 
@@ -156,7 +160,7 @@ The Community Plugins catalog installs upstream MD Reader by mrrepac. It does no
 
 ### Install this fork manually
 
-Download `md-reader-2.1.2.zip` from the [Supernote fork prerelease](https://github.com/ofples/obsidian-md-reader/releases/tag/v2.1.2), extract it, and copy the `md-reader` folder into your vault's plugin folder. The ZIP is ready to install; no build step is needed. It contains these four files:
+Download `md-reader-2.1.3.zip` from the [Supernote fork prerelease](https://github.com/ofples/obsidian-md-reader/releases/tag/v2.1.3), extract it, and copy the `md-reader` folder into your vault's plugin folder. The ZIP is ready to install; no build step is needed. It contains these four files:
 
 ```text
 main.js
@@ -180,9 +184,10 @@ The logic and UI smoke tests stub the `obsidian` module (and a minimal DOM) and 
 ```
 node tests/logic.mjs
 node tests/ui.mjs
+node tests/digests.mjs
 ```
 
-`logic.mjs` covers chapter splitting, text anchors, appearance presets, reading position, navigation, encodings and the TXT converter. `ui.mjs` checks the library, settings, workspace restoration and quote storage, including concurrent appends and filename collisions.
+`logic.mjs` covers chapter splitting, text anchors, appearance presets, reading position, navigation, encodings and the TXT converter. `ui.mjs` checks the library, settings, workspace restoration and quote storage, including concurrent appends and filename collisions. `digests.mjs` checks selection-text cleanup, provenance validation, stale-range handling, local request state and callback validation.
 
 Browser tests use Playwright and Chromium (`npm install --no-save --package-lock=false playwright`, then `npx playwright install chromium`):
 

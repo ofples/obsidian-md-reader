@@ -1,9 +1,9 @@
 {
   "id": "md-reader",
   "name": "MD Reader",
-  "version": "2.1.2",
+  "version": "2.1.3",
   "minAppVersion": "1.4.0",
-  "description": "Read your notes and books like an e-book: pages you flip sideways by swipe, tap or arrow keys, with a library, contents, search and bookmarks. Imports fb2, epub and txt to Markdown.",
+  "description": "Read notes and books as paginated Markdown, import books, and send selected text to Supernote Digest on Android.",
   "author": "mrrepac",
   "authorUrl": "https://github.com/mrrepac",
   "isDesktopOnly": false
