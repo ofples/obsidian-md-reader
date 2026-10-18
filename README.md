@@ -2,9 +2,9 @@
 
 > **Supernote fork:** an adaptation of [upstream MD Reader](https://github.com/mrrepac/obsidian-md-reader) that preserves its e-book reader and adds optional integrations. See [FORK.md](FORK.md) for provenance and integration details.
 
-## Supernote fork version 2.1.3
+## Supernote fork version 2.2.0
 
-Read Obsidian notes and books as paginated, horizontally flipping pages. This fork works on its own with any Obsidian theme; Paper and Sidebar are optional companions. It supports inline page links and selection provenance for managed Supernote Transcripts, while ordinary Markdown remains independent of Transcripts. On Android, send selected text to Supernote Bridge for a confirmed Digest save. See [integration details](INTEGRATION.md) and the [Nomad and desktop workflow](https://github.com/ofples/supernote-transcripts/blob/main/docs/workflow.md).
+Read Obsidian notes and books as paginated, horizontally flipping pages. This fork works on its own with any Obsidian theme; Paper and Sidebar are optional companions. It supports inline page links and selection provenance for managed Supernote Transcripts, while ordinary Markdown remains independent of Transcripts. On Android, **Digest** starts the quick Bridge flow and **Digest with note…** opens the review flow. **Highlight** saves a persistent Reader annotation that syncs as an ordinary Markdown file; **Copy** copies the selected text. See [integration details](INTEGRATION.md) and the [Nomad and desktop workflow](https://github.com/ofples/supernote-transcripts/blob/main/docs/workflow.md).
 
 Read your Obsidian notes — and your books — like an e-book.
 
@@ -12,9 +12,15 @@ MD Reader renders a note into fixed-size **pages** and lets you flip through the
 
 It also **imports FB2, EPUB and TXT books into Markdown**, so a whole library lives inside your vault as ordinary notes you can link, quote and search like anything else.
 
-### Save a passage to Supernote Digest
+### Selection actions and Reader highlights
 
-On a compatible Supernote, select a passage and choose **Save to Supernote Digest** from the Reader menu or selected-text toolbar. Review it in Supernote Bridge, tap **Save Digest**, then return to Obsidian for confirmation. Ordinary Markdown works without Transcripts and retains its file and quote context. Managed transcripts require Transcripts 0.15 and a matching local mirror. Bridge can open the original notebook after saving; the native Digest app's own jump-back action is unsupported. See [setup and limits](docs/native-digests.md).
+Select text to show **Digest**, **Digest with note…**, **Highlight**, and **Copy**. Digest actions are Android-only. The first Quick Digest asks Bridge for one-time approval; later quick saves use the default list configured in Bridge. **Digest with note…** shows the review flow. Reader records per-request status so reopening an unfinished handoff uses the same ID; it does not automatically retry an uncertain provider insert. Settings let you configure Bridge defaults or reconnect Quick Digest if Bridge trust was revoked. The quote-collection action remains available from the context menu and command as **Save quote to Obsidian**.
+
+Reader highlights are saved separately under the vault's `Reader Highlights` folder, one Markdown file per excerpt anchor. Tap a saved highlight for its menu: **Copy**, **Remove highlight**, and Digest actions. When a matching receipt is available on this device, the menu offers **Open Digest**; use **Edit** in the native Digest app. Without a local receipt, it offers **Digest** and **Digest with note…**. Overlapping excerpts are presented as separate choices. A short tap opens the menu; long-press remains available for selecting text. Removing a Reader highlight deletes only its annotation file, never the native Digest.
+
+Reader highlight annotations sync as ordinary Markdown. The receipt link that enables **Open Digest** is kept in per-vault local storage and is device-specific; native Digest row IDs are not written into synced annotation files. Highlights never edit the source note. Reader paints only an unambiguous match with saved surrounding context, plus an exact full-text match in a single-chapter note; uncertain matches remain in the Highlights manager. Ordinary Markdown works without Transcripts. Managed transcripts require Transcripts 0.15 and a matching local mirror. See [setup and limits](docs/native-digests.md).
+
+Automated verification passed: 123 logic, 113 UI, Digest protocol/storage, 56 reading, and 61 layout checks. On the checked Nomad, Copy/clipboard restore, highlight persistence/reopen/removal, both Quick Digest paths, detailed review with a non-default list, saved-highlight menu, receipt reopen and native Edit were verified. Cleanup is complete: all three temporary native Digests and Reader highlights were removed, the browser fixture was deleted after a SHA check, and prior reading positions and clipboard state were restored. These device results apply to the checked provider version; see [native Digest notes](docs/native-digests.md) for scope and remaining checks.
 
 ## Fixed in 2.0.3
 
@@ -96,7 +102,7 @@ While reading:
 - **Jump anywhere:** drag the progress bar at the very bottom. `Home` / `End` go to the start and the end of the whole book.
 - **Resize the text:** `Ctrl/Cmd` `+` / `−`, or pinch with two fingers.
 - **Select and copy** with the mouse — dragging across the text no longer flips the page.
-- **Save a quote.** Select text in the book and press the **❞** button beside the reading controls, right-click → **Save selected text as a quote**, or use the command of the same name. The quote is appended to a Markdown note for that book, with a link to the source and its heading when available. Reading stays on the same page.
+- **Save a quote.** Select text, open the context menu → **Save quote to Obsidian**, or use the command of the same name. The quote is appended to a Markdown note for that book, with a link to the source and its heading when available. Reading stays on the same page.
 
 Quotes go to **`Books/Quotes`** by default; the folder is created on the first save. Change **Quotes folder** in the MD Reader settings to use another folder inside the vault. Each book gets its own note, and books with identical names get separate files. An unrelated existing note is never overwritten. The configured quotes subfolder is excluded from automatic library discovery; you can still add a quote note to the library manually.
 
@@ -160,7 +166,7 @@ The Community Plugins catalog installs upstream MD Reader by mrrepac. It does no
 
 ### Install this fork manually
 
-Download `md-reader-2.1.3.zip` from the [Supernote fork prerelease](https://github.com/ofples/obsidian-md-reader/releases/tag/v2.1.3), extract it, and copy the `md-reader` folder into your vault's plugin folder. The ZIP is ready to install; no build step is needed. It contains these four files:
+Download the latest fork ZIP from the [Supernote fork releases](https://github.com/ofples/obsidian-md-reader/releases/latest), extract it, and copy the `md-reader` folder into your vault's plugin folder. The ZIP is ready to install; no build step is needed. It contains these four files:
 
 ```text
 main.js
@@ -187,7 +193,7 @@ node tests/ui.mjs
 node tests/digests.mjs
 ```
 
-`logic.mjs` covers chapter splitting, text anchors, appearance presets, reading position, navigation, encodings and the TXT converter. `ui.mjs` checks the library, settings, workspace restoration and quote storage, including concurrent appends and filename collisions. `digests.mjs` checks selection-text cleanup, provenance validation, stale-range handling, local request state and callback validation.
+`logic.mjs` covers chapter splitting, text anchors, appearance presets, reading position, navigation, encodings and the TXT converter. `ui.mjs` checks the library, settings, workspace restoration and quote storage, including concurrent appends and filename collisions. `digests.mjs` checks selection-text cleanup, provenance validation, stale-range handling, local request state and callback validation, including storage-failure replay for receipt association.
 
 Browser tests use Playwright and Chromium (`npm install --no-save --package-lock=false playwright`, then `npx playwright install chromium`):
 

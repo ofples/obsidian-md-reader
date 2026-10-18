@@ -64,7 +64,185 @@ const DIGEST_JSON_LIMIT = 40000;
 const DIGEST_URI_LIMIT = 150000;
 const DIGEST_REQUEST_RE = /^[a-f0-9]{64}$/;
 const DIGEST_RESULT_ACTION = 'md-reader-digest-result';
-const DIGEST_IGNORE_SELECTOR = '.st-page-link,.st-digest-anchor,button,[role="button"],.hr-ui,[data-selection-ignore]';
+const DIGEST_IGNORE_SELECTOR = '.st-page-link,.st-digest-anchor,button,[role="button"]:not(.hr-persistent-highlight),.hr-ui,[data-selection-ignore]';
+const HIGHLIGHT_OPEN = '<!-- md-reader-highlight:v1';
+const HIGHLIGHT_CLOSE = '-->';
+const QUICK_STORE_PREFIX = 'md-reader-quick-v1:';
+const DIGEST_ANNOTATION_PREFIX = 'md-reader-digest-annotation-v1:';
+const PERSISTENT_HIGHLIGHTS = new WeakMap();
+
+function normalizeHighlightText(value, limit = 240, keepEnd = false) {
+  let text = String(value || '').replace(/[\u0000-\u001f\u007f-\u009f\s]+/gu, ' ').trim();
+  if (text.length > limit) text = keepEnd ? text.slice(-limit) : text.slice(0, limit);
+  if (text.length && /[\uDC00-\uDFFF]/.test(text[0])) text = text.slice(1);
+  if (text.length && /[\uD800-\uDBFF]/.test(text[text.length - 1])) text = text.slice(0, -1);
+  return text.trim();
+}
+
+async function highlightIdentityId(identity) {
+  const normalized = {
+    source: String(identity.source || '').replace(/\\/g, '/').replace(/^\.\//, ''),
+    quote: normalizeHighlightText(identity.quote, 15000),
+    before: normalizeHighlightText(identity.before, 240),
+    after: normalizeHighlightText(identity.after, 240),
+  };
+  const canonical = JSON.stringify(normalized);
+  let bytes;
+  if (globalThis.crypto?.subtle?.digest) bytes = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
+  else bytes = require('crypto').createHash('sha256').update(canonical, 'utf8').digest();
+  return Array.from(new Uint8Array(bytes)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function parseHighlightRecord(markdown) {
+  const source = String(markdown || '');
+  if (!source.startsWith(HIGHLIGHT_OPEN + '\n')) return null;
+  const end = source.indexOf('\n' + HIGHLIGHT_CLOSE, HIGHLIGHT_OPEN.length + 1);
+  if (end < 0 || end > 128 * 1024 || source.length > 256 * 1024 || new TextEncoder().encode(source).length > 256 * 1024) return null;
+  try {
+    const record = JSON.parse(source.slice(HIGHLIGHT_OPEN.length + 1, end));
+    if (!record || record.version !== 1 || typeof record.id !== 'string' || !DIGEST_REQUEST_RE.test(record.id) ||
+        typeof record.source !== 'string' || !digestSafeVaultPath(record.source) ||
+        typeof record.quote !== 'string' || !record.quote || record.quote.length > DIGEST_TEXT_LIMIT ||
+        typeof record.before !== 'string' || record.before.length > 240 || typeof record.after !== 'string' || record.after.length > 240 ||
+        typeof record.created !== 'string' || !Number.isFinite(Date.parse(record.created)) ||
+        (record.heading !== undefined && (typeof record.heading !== 'string' || record.heading.length > 256)) ||
+        (record.fileId !== undefined && (typeof record.fileId !== 'string' || !record.fileId || record.fileId.length > 256 || /[\u0000-\u001f\u007f-\u009f]/.test(record.fileId))) ||
+        (record.pageIds !== undefined && (!Array.isArray(record.pageIds) || !record.pageIds.length || record.pageIds.length > 100 ||
+          record.pageIds.some((id) => typeof id !== 'string' || id.length < 8 || id.length > 256 || !id.startsWith('native:') || /[\u0000-\u001f\u007f-\u009f]/.test(id)) ||
+          new Set(record.pageIds).size !== record.pageIds.length))) return null;
+    return record;
+  } catch (_) { return null; }
+}
+
+function highlightRecordMarkdown(record) {
+  const clean = { ...record };
+  const json = JSON.stringify(clean).replace(/&/g, '\\u0026').replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+  const body = HIGHLIGHT_OPEN + '\n' + json + '\n' + HIGHLIGHT_CLOSE + '\n\n> ' +
+    record.quote.replace(/\n/g, '\n> ') + '\n\n_Source: `' + record.source.replace(/`/g, '\\`') + '`_\n';
+  if (body.length > 256 * 1024 || new TextEncoder().encode(body).length > 256 * 1024) throw new Error('Highlight file exceeds its size limit');
+  return body;
+}
+
+function highlightCandidates(text, record) {
+  const quote = normalizeHighlightText(record.quote, DIGEST_TEXT_LIMIT);
+  if (!quote || !text) return [];
+  const before = normalizeHighlightText(record.before, 240);
+  const after = normalizeHighlightText(record.after, 240);
+  const candidates = [];
+  let at = text.indexOf(quote);
+  while (at >= 0) {
+    const left = normalizeHighlightText(text.slice(Math.max(0, at - before.length * 4 - 32), at), Math.min(4096, before.length + 4), true);
+    const right = normalizeHighlightText(text.slice(at + quote.length, at + quote.length + after.length * 4 + 32), 4096);
+    const beforeMatches = !before || left.endsWith(before);
+    const afterMatches = !after || right.startsWith(after);
+    candidates.push({ start: at, end: at + quote.length, contextMatches: beforeMatches && afterMatches });
+    at = text.indexOf(quote, at + 1);
+    if (candidates.length > 100) return [];
+  }
+  if (candidates.length === 1) return candidates[0].contextMatches && (before || after) ? candidates : [];
+  if (!candidates.length) return [];
+  const supported = candidates.filter((candidate) => candidate.contextMatches);
+  return supported.length === 1 ? supported : [];
+}
+
+function digestLocalStorage() { try { return window.localStorage; } catch (_) { return null; } }
+
+function quickStoreKey(vault) { return QUICK_STORE_PREFIX + encodeURIComponent(vault); }
+function quickPendingKey(vault) { return QUICK_STORE_PREFIX + 'pending:' + encodeURIComponent(vault); }
+function digestAnnotationKey(vault) { return DIGEST_ANNOTATION_PREFIX + encodeURIComponent(vault); }
+
+function readDigestAnnotationLinks(vault, storage) {
+  try {
+    const value = JSON.parse(storage?.getItem(digestAnnotationKey(vault)) || '{}');
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return { pending: {}, receipts: {} };
+    const pending = {}, receipts = {};
+    for (const [request, annotation] of Object.entries(value.pending || {})) {
+      if (DIGEST_REQUEST_RE.test(request) && DIGEST_REQUEST_RE.test(annotation)) pending[request] = annotation;
+    }
+    for (const [annotation, receipt] of Object.entries(value.receipts || {})) {
+      if (DIGEST_REQUEST_RE.test(annotation) && receipt && typeof receipt === 'object' &&
+          DIGEST_REQUEST_RE.test(receipt.request) && Number.isSafeInteger(receipt.id) && receipt.id > 0) {
+        receipts[annotation] = { request: receipt.request, id: receipt.id };
+      }
+    }
+    return { pending, receipts };
+  } catch (_) { return { pending: {}, receipts: {} }; }
+}
+
+function writeDigestAnnotationLinks(vault, storage, links) {
+  try { storage?.setItem(digestAnnotationKey(vault), JSON.stringify(links)); return !!storage; }
+  catch (_) { return false; }
+}
+
+function readQuickCredentials(vault, storage) {
+  try {
+    const value = JSON.parse(storage?.getItem(quickStoreKey(vault)) || 'null');
+    if (value && /^[a-f0-9]{32}$/.test(value.client) && /^[a-f0-9]{64}$/.test(value.secret) && typeof value.trusted === 'boolean') return value;
+  } catch (_) { /* local device storage is optional */ }
+  return null;
+}
+
+function validQuickCallback(params, pending) {
+  return typeof params?.quick === 'string' && /^[a-f0-9]{32}$/.test(params.quick) &&
+    !!pending && pending.client === params.quick && pending.vault === params.vault && pending.requestId === params.request;
+}
+
+function readQuickPending(vault, storage) {
+  try {
+    const value = JSON.parse(storage?.getItem(quickPendingKey(vault)) || '{}');
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    const result = {};
+    for (const [requestId, client] of Object.entries(value)) {
+      if (DIGEST_REQUEST_RE.test(requestId) && /^[a-f0-9]{32}$/.test(client)) result[requestId] = client;
+    }
+    return result;
+  } catch (_) { return {}; }
+}
+
+function writeQuickPending(vault, storage, requests) {
+  try { storage?.setItem(quickPendingKey(vault), JSON.stringify(requests)); return !!storage; }
+  catch (_) { return false; }
+}
+
+function resetQuickCredentials(vault, storage) {
+  try { storage?.removeItem(quickStoreKey(vault)); storage?.removeItem(quickPendingKey(vault)); return !!storage; }
+  catch (_) { return false; }
+}
+
+function setDocumentPersistentHighlights(doc, view, ranges) {
+  if (!doc) return;
+  const css = doc.defaultView?.CSS, HighlightCtor = doc.defaultView?.Highlight;
+  if (!css?.highlights || typeof HighlightCtor !== 'function') return;
+  let views = PERSISTENT_HIGHLIGHTS.get(doc);
+  if (!views) { views = new Map(); PERSISTENT_HIGHLIGHTS.set(doc, views); }
+  if (ranges?.length) views.set(view, ranges); else views.delete(view);
+  const all = [...views.values()].flat();
+  if (all.length) css.highlights.set('md-reader-persistent', new HighlightCtor(...all));
+  else css.highlights.delete('md-reader-persistent');
+}
+
+async function makeQuickEnvelope(vault, json, requestId, storage) {
+  let credentials = readQuickCredentials(vault, storage);
+  if (!credentials) {
+    if (!globalThis.crypto?.getRandomValues || !globalThis.crypto?.subtle?.importKey || !globalThis.crypto?.subtle?.sign) {
+      throw new Error('Secure signing is unavailable');
+    }
+    const clientBytes = new Uint8Array(16), secretBytes = new Uint8Array(32);
+    globalThis.crypto.getRandomValues(clientBytes); globalThis.crypto.getRandomValues(secretBytes);
+    const hex = (bytes) => Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+    credentials = { client: hex(clientBytes), secret: hex(secretBytes), trusted: false };
+    storage?.setItem(quickStoreKey(vault), JSON.stringify(credentials));
+    if (readQuickCredentials(vault, storage)?.client !== credentials.client) throw new Error('Local secure storage is unavailable');
+  }
+  const time = String(Date.now());
+  const key = await globalThis.crypto.subtle.importKey('raw', new Uint8Array(credentials.secret.match(/../g).map((x) => parseInt(x, 16))),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const message = 'supernote-bridge-quick-v1\n' + credentials.client + '\n' + time + '\n' + json;
+  const signature = await globalThis.crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+  const sig = Array.from(new Uint8Array(signature)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  return { credentials, query: 'mode=quick&client=' + credentials.client + '&time=' + time + '&signature=' + sig +
+    (credentials.trusted ? '' : '&setup=' + credentials.secret) };
+}
 
 function digestSelectionText(range) {
   if (!range || typeof range.cloneContents !== 'function') return '';
@@ -157,7 +335,7 @@ function writeDigestState(vault, storage, state) {
 function validateDigestResult(params) {
   if (!params || typeof params !== 'object' || Array.isArray(params)) return null;
   const keys = Object.keys(params);
-  if (keys.some((key) => !['action','vault','request','status','id'].includes(key)) ||
+  if (keys.some((key) => !['action','vault','request','status','id','quick'].includes(key)) ||
       (params.action !== undefined && params.action !== DIGEST_RESULT_ACTION) ||
       !keys.includes('vault') || typeof params.vault !== 'string' || !params.vault || params.vault.length > 256 ||
       !keys.includes('request') || typeof params.request !== 'string' || !keys.includes('status') || !DIGEST_REQUEST_RE.test(params.request) ||
@@ -165,7 +343,10 @@ function validateDigestResult(params) {
   if (params.status === 'saved') {
     if (!keys.includes('id') || typeof params.id !== 'string' || !/^[1-9]\d{0,15}$/.test(params.id) || !Number.isSafeInteger(Number(params.id))) return null;
   } else if (keys.includes('id')) return null;
-  return { vault: params.vault, requestId: params.request, status: params.status, id: params.status === 'saved' ? Number(params.id) : null };
+  if (params.quick !== undefined && (typeof params.quick !== 'string' || !/^[a-f0-9]{32}$/.test(params.quick))) return null;
+  if (params.quick !== undefined && params.status !== 'saved') return null;
+  return { vault: params.vault, requestId: params.request, status: params.status,
+    id: params.status === 'saved' ? Number(params.id) : null, quick: params.quick || null };
 }
 
 function validateDigestNote(note) {
@@ -320,13 +501,16 @@ const STRINGS = {
     sShowPosition: 'Show page number and percentage',
     sShowChapter: 'Show chapter name',
     sShowTime: 'Show time left',
-    quoteSave: 'Save selected text as a quote',
+    quoteSave: 'Save quote to Obsidian',
     quoteCopy: 'Copy selected text',
     quoteSelect: 'Select text in the book first.',
     quoteSaved: 'Quote saved: ',
     quoteFailed: 'Could not save the quote. Check the quotes folder in MD Reader settings.',
     quoteFolderName: 'Quotes folder',
     quoteFolderDesc: 'One Markdown note per book. Path inside the vault; empty uses Books/Quotes.',
+    nativeDigestSettings: 'Native Digests',
+    configureDigestDefaults: 'Configure defaults in Supernote Bridge',
+    digestDefaultsHint: 'Available on Android when Supernote Bridge is installed.',
     quoteTitle: 'Quotes',
     sPaddingDesc: 'Empty space at the top and bottom of the page',
     cmdTint: 'Cycle page tint',
@@ -774,6 +958,46 @@ class NotePickModal extends SuggestModal {
    На телефоне ридер живёт в иммерсивном режиме: чтобы добраться оттуда до
    настроек плагина, надо вернуть весь интерфейс и уйти из книги.
    ============================================================ */
+class HighlightManagerModal extends Modal {
+  constructor(app, plugin) { super(app); this.plugin = plugin; }
+  async onOpen() {
+    const { contentEl } = this;
+    contentEl.addClass('hr-highlights-manager');
+    this.modalEl.addClass('sn-reader-settings');
+    this.titleEl.setText('Reader Highlights');
+    const loading = contentEl.createDiv({ cls: 'hr-ap-hint', text: 'Loading saved annotations…' });
+    let records = [];
+    try { records = await this.plugin.allHighlights(); }
+    catch (_) { loading.setText('Could not read Reader Highlights. Check the vault folder.'); return; }
+    if (!this.contentEl?.isConnected) return;
+    loading.remove();
+    if (!records.length) { contentEl.createDiv({ cls: 'hr-ap-hint', text: 'No saved highlights yet.' }); return; }
+    for (const { record, file } of records) {
+      const row = contentEl.createDiv('hr-highlight-row');
+      row.createDiv({ cls: 'hr-highlight-quote', text: record.quote });
+      const meta = row.createDiv({ cls: 'hr-highlight-meta' });
+      meta.setText(record.source + (record.heading ? ' · ' + record.heading : ''));
+      const source = this.app.vault.getAbstractFileByPath(record.source);
+      const visible = source && this.app.workspace.getLeavesOfType(VIEW_TYPE_READER)
+        .some((leaf) => leaf.view?.file?.path === record.source && (leaf.view._persistentHighlightRecords || []).some((x) => x.record.id === record.id));
+      if (!visible) meta.appendText(' · Not currently matched in an open Reader chapter');
+      const actions = row.createDiv('hr-highlight-actions');
+      actions.createEl('button', { text: 'Open source' }).addEventListener('click', () => {
+        if (source) this.plugin.openReader(source);
+        else new Notice('The original Markdown source is missing.');
+      });
+      actions.createEl('button', { text: 'Remove highlight' }).addEventListener('click', async () => {
+        try {
+          await this.plugin.removeHighlightRecord(record.id);
+          this.contentEl.empty(); await this.onOpen();
+          this.plugin.refreshHighlightOverlays(record.source);
+        } catch (error) { new Notice('Could not safely remove this highlight.'); }
+      });
+    }
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
 class AppearanceModal extends Modal {
   constructor(app, plugin) {
     super(app);
@@ -1301,7 +1525,7 @@ function readerTextIndex(content) {
   let node, previousBlock = null;
   while ((node = walker.nextNode())) {
     const parent = node.parentElement;
-    if (!parent || parent.closest('.hr-title, .markdown-embed, script, style, button, .copy-code-button, .katex-mathml') || !parent.getClientRects().length) continue;
+    if (!parent || parent.closest('.hr-title, .markdown-embed, script, style, button, .copy-code-button, .katex-mathml, .st-page-link, .st-digest-anchor, [data-selection-ignore]') || !parent.getClientRects().length) continue;
     const block = parent.closest('p, li, h1, h2, h3, h4, h5, h6, pre, td, th, blockquote');
     if (block !== previousBlock && chars.length && chars[chars.length - 1] !== ' ') chars.push(' ');
     previousBlock = block;
@@ -1329,7 +1553,7 @@ function readerTextIndex(content) {
     range.setEnd(segment.node, offset + 1);
     return range;
   };
-  return { text: chars.join(''), rangeAt };
+  return { text: chars.join(''), rangeAt, segments };
 }
 
 class ReaderView extends ItemView {
@@ -1558,19 +1782,28 @@ class ReaderView extends ItemView {
     const menuButton = tools.createEl('button', { cls: 'hr-reader-menu', text: t('menuButton'), attr: { 'aria-label': t('menuNav'), 'aria-haspopup': 'menu' } });
     this.statusText = tools.createDiv('hr-status-text');
     const appearanceButton = tools.createEl('button', { cls: 'hr-reader-appearance', text: 'Aa', attr: { 'aria-label': t('menuAppearance'), title: t('menuAppearance') } });
-    this.quoteButton = tools.createEl('button', { cls: 'hr-reader-quote', text: '❞', attr: { 'aria-label': t('quoteSave'), title: t('quoteSave') } });
-    this.quoteButton.hidden = true;
-    // Preserve the browser selection when a mouse click focuses the button.
-    this.registerDomEvent(this.quoteButton, 'mousedown', (e) => e.preventDefault());
-    this.registerDomEvent(this.quoteButton, 'click', (e) => { e.stopPropagation(); this.saveSelectedQuote(); });
+    // Selection actions live outside the ordinary statusbar. Paper and other
+    // reader skins may intentionally hide that bar while retaining gestures.
+    this.selectionActions = vp.createDiv('hr-reader-selection-actions');
+    this.selectionActions.hidden = true;
+    this.selectionActions.setAttribute('role', 'toolbar');
+    this.selectionActions.setAttribute('aria-label', 'Selected text actions');
+    this.selectionActions.dataset.ignoreSwipe = 'true';
+    this.selectionActions.dataset.readerGestureIgnore = 'true';
+    this.registerDomEvent(this.selectionActions, 'mousedown', (event) => event.preventDefault());
+    const actionButton = (cls, text, label, handler) => {
+      const button = this.selectionActions.createEl('button', { cls, text, attr: { 'aria-label': label, title: label } });
+      button.hidden = true;
+      this.registerDomEvent(button, 'mousedown', (e) => { e.preventDefault(); this._actionSelection = this._digestSelection || this._selectedQuote || this.selectedQuote(); });
+      this.registerDomEvent(button, 'click', (e) => { e.stopPropagation(); this._selectionActionPromise = handler.call(this, this._actionSelection); this._actionSelection = null; });
+      return button;
+    };
     if (digestIsAndroid()) {
-      this.digestButton = tools.createEl('button', { cls: 'hr-reader-digest', text: 'Digest', attr: {
-        'aria-label': 'Save to Supernote Digest', title: 'Save to Supernote Digest',
-      } });
-      this.digestButton.hidden = true;
-      this.registerDomEvent(this.digestButton, 'mousedown', (e) => e.preventDefault());
-      this.registerDomEvent(this.digestButton, 'click', (e) => { e.stopPropagation(); this.saveSelectedDigest(); });
+      this.digestButton = actionButton('hr-reader-digest', 'Digest', 'Digest', function (selection) { return this.saveSelectedDigest(selection, 'quick'); });
+      this.digestReviewButton = actionButton('hr-reader-digest-review', 'Digest with note…', 'Digest with note', function (selection) { return this.saveSelectedDigest(selection, 'review'); });
     }
+    this.highlightButton = actionButton('hr-reader-highlight', 'Highlight', 'Highlight selection', function (selection) { return this.toggleSelectedHighlight(selection); });
+    this.copyButton = actionButton('hr-reader-copy', 'Copy', 'Copy selection', function (selection) { return this.copySelectedText(selection); });
     this.setupQuoteSelection();
     this.registerDomEvent(menuButton, 'click', (e) => {
       e.stopPropagation();
@@ -1603,6 +1836,7 @@ class ReaderView extends ItemView {
 
   async onClose() {
     ++this._renderGen; // invalidate file reads/renders still in flight
+    this.clearPersistentHighlights();
     this.popScope();
     this.hideEnd();
     this.closeFootnote();
@@ -1779,6 +2013,7 @@ class ReaderView extends ItemView {
     // подсветку находки уносить с собой нельзя: блок ляжет в кэш вместе с ней, и при
     // возврате прошлый запрос будет светиться посреди текста как ни в чём не бывало
     this.clearHighlight();
+    this.clearPersistentHighlights();
 
     // уходим из целиком отрисованного блока — откладываем его, а не выбрасываем.
     // Недорисованный (прервали на середине) в кэш класть нельзя
@@ -1791,8 +2026,7 @@ class ReaderView extends ItemView {
     this._readingAnchor = null;
     this._selectedQuote = null;
     this._digestSelection = null;
-    if (this.quoteButton) this.quoteButton.hidden = true;
-    if (this.digestButton) this.digestButton.hidden = true;
+    this.hideSelectionActions();
     this.content.style.transform = 'translateX(0px)';
     this.page = 0;
     this._measured = false;
@@ -1822,7 +2056,6 @@ class ReaderView extends ItemView {
       }
       if (gen !== this._renderGen) return;
     }
-    this._blockReady = true;
     this.decorateFootnotes(this.content);
 
     // заголовок-имя файла — только на первой главе и только если нет своего H1
@@ -1838,6 +2071,9 @@ class ReaderView extends ItemView {
       }
     }
 
+    await this.applyPersistentHighlights(gen);
+    if (gen !== this._renderGen) return;
+
     this.content.querySelectorAll('img, audio, video').forEach((el) => {
       const onload = () => { if (this._debouncedRemeasure) this._debouncedRemeasure(); };
       if (el.tagName === 'IMG') {
@@ -1852,6 +2088,7 @@ class ReaderView extends ItemView {
     this._raf = requestAnimationFrame(() => {
       this._raf = 0;
       if (gen !== this._renderGen || !this.content || !this.content.isConnected) return;
+      this._blockReady = true;
       // measure() сам применит отложенную позицию (долю или прыжок к заголовку) после реального замера
       this.measure();
     });
@@ -2062,6 +2299,11 @@ class ReaderView extends ItemView {
     // ResizeObserver also fires for a newly opened, still empty view. Until
     // Markdown is ready, measuring would turn that empty page into 100%.
     if (this._blockReady === false) return;
+    // During a hot reload the host can detach plugin CSS before this view is
+    // closed, then attach it after the new view has rendered. Without the
+    // multicolumn layout, the first read looks like one long page and would
+    // consume the saved anchor and overwrite its durable position.
+    if (!this.readerLayoutReady()) return;
     const s = this.plugin.settings;
     const vpW = this.viewport.clientWidth;
     if (!vpW) return;
@@ -2176,8 +2418,7 @@ class ReaderView extends ItemView {
     if (np !== this.page) {
       this._selectedQuote = null;
       this._digestSelection = null;
-      if (this.quoteButton) this.quoteButton.hidden = true;
-      if (this.digestButton) this.digestButton.hidden = true;
+      this.hideSelectionActions();
     }
     // сноска относится к странице: перелистнули — закрыли; пересчёт той же страницы
     // (поворот, новый размер шрифта) — только переставили к её маркеру
@@ -2532,9 +2773,7 @@ class ReaderView extends ItemView {
     const quote = liveQuote || this._selectedQuote;
     if (quote) {
       if (liveQuote) { this._selectedQuote = liveQuote; this._digestSelection = liveQuote; }
-      menu.addItem((i) => i.setTitle(t('quoteSave')).setIcon('quote').onClick(() => this.saveSelectedQuote(quote)));
-      if (digestIsAndroid()) menu.addItem((i) => i.setTitle('Save to Supernote Digest').setIcon('bookmark-plus')
-        .onClick(() => this.saveSelectedDigest(this._digestSelection)));
+      this.addSelectionMenuItems(menu, quote, true);
     }
     menu.addItem((i) => i.setTitle(t('menuToc')).setIcon('list').onClick(() => this.openToc()));
     menu.addItem((i) => i.setTitle(t('menuSearch')).setIcon('search').onClick(() => this.openSearch()));
@@ -2550,6 +2789,7 @@ class ReaderView extends ItemView {
     // в иммерсивном режиме это единственная дорога наружу: шапка вкладки спрятана,
     // а на телефоне спрятана и нижняя панель Obsidian
     menu.addItem((i) => i.setTitle(t('menuLibrary')).setIcon('book-open').onClick(() => this.plugin.openLibrary()));
+    menu.addItem((i) => i.setTitle('Highlights').setIcon('highlighter').onClick(() => this.plugin.openHighlights()));
     menu.addItem((i) => i.setTitle(t('menuEdit')).setIcon('pencil').onClick(() => this.openInEditor()));
     menu.addSeparator();
     const here = this.bookmarkOnPage();
@@ -2591,7 +2831,7 @@ class ReaderView extends ItemView {
     const selection = this.content.ownerDocument.getSelection();
     if (!selection || selection.isCollapsed || !selection.rangeCount) return null;
     const range = selection.getRangeAt(0);
-    if (!this.content.contains(range.startContainer) || !this.content.contains(range.endContainer)) return null;
+    if (range.collapsed || !this.content.contains(range.startContainer) || !this.content.contains(range.endContainer)) return null;
     const rangeSnapshot = range.cloneRange();
     const text = digestSelectionText(rangeSnapshot);
     if (!text) return null;
@@ -2604,8 +2844,13 @@ class ReaderView extends ItemView {
       const el = this.resolveHeadingEl(entry.hIndex, entry.text);
       if (el && (range.comparePoint(el, 0) < 0 || el.contains(range.startContainer))) heading = entry.text;
     }
-    return { file: this.file, text, heading, range: rangeSnapshot, renderGen: this._renderGen,
+    return { file: this.file, text, heading, range: rangeSnapshot, contextRoot: this.content, renderGen: this._renderGen,
       sourcePath: this.file.path, sourceMtime: this.file.stat?.mtime };
+  }
+
+  hideSelectionActions() {
+    if (this.selectionActions) this.selectionActions.hidden = true;
+    for (const button of [this.digestButton, this.digestReviewButton, this.highlightButton, this.copyButton]) if (button) button.hidden = true;
   }
 
   setupQuoteSelection() {
@@ -2617,28 +2862,318 @@ class ReaderView extends ItemView {
         this._selectedQuote = quote;
         this._digestSelection = quote;
         this.viewport.classList.remove('hr-hide-ui');
-      } else if (selection && ((!selection.isCollapsed) || this.content.contains(selection.anchorNode))) {
+      } else {
         this._selectedQuote = null;
         this._digestSelection = null;
       }
-      if (this.quoteButton) this.quoteButton.hidden = !this._selectedQuote;
-      if (this.digestButton) this.digestButton.hidden = !this._digestSelection;
+      if (quote) {
+        if (this.selectionActions) this.selectionActions.hidden = false;
+        for (const button of [this.digestButton, this.digestReviewButton, this.highlightButton, this.copyButton]) if (button) button.hidden = false;
+      } else this.hideSelectionActions();
     });
     this.registerDomEvent(this.content, 'contextmenu', (event) => {
+      const persistent = this.persistentHighlightsAtTarget(event.target);
+      if (persistent.length) {
+        event.preventDefault(); event.stopPropagation();
+        this.showPersistentHighlightMenu(persistent, event);
+        return;
+      }
       const quote = this.selectedQuote();
       if (!quote) return;
       this._selectedQuote = quote;
       this._digestSelection = quote;
       event.preventDefault(); event.stopPropagation();
       const menu = new Menu();
-      menu.addItem((i) => i.setTitle(t('quoteSave')).setIcon('quote').onClick(() => this.saveSelectedQuote(quote)));
-      if (digestIsAndroid()) menu.addItem((i) => i.setTitle('Save to Supernote Digest').setIcon('bookmark-plus')
-        .onClick(() => this.saveSelectedDigest(this._digestSelection)));
-      menu.addItem((i) => i.setTitle(t('quoteCopy')).setIcon('copy').onClick(() => {
-        doc.defaultView.navigator.clipboard.writeText(quote.text).catch((error) => console.error('MD Reader: copy failed', error));
-      }));
+      this.addSelectionMenuItems(menu, quote, true);
       menu.showAtPosition({ x: event.clientX, y: event.clientY });
     });
+    this.registerDomEvent(this.content, 'click', (event) => {
+      const persistent = this.persistentHighlightsAtTarget(event.target);
+      if (!persistent.length || (this._ignoreNextHighlightClickUntil || 0) > Date.now()) return;
+      if (event.detail > 1) return;
+      const down = this._highlightMouseDown;
+      this._highlightMouseDown = null;
+      if (event.detail > 0 && (!down || Date.now() - down.time > 600 ||
+          Math.hypot(event.clientX - down.x, event.clientY - down.y) > 10)) return;
+      event.preventDefault(); event.stopPropagation();
+      this.showPersistentHighlightMenu(persistent, event);
+    });
+    this.registerDomEvent(this.content, 'mousedown', (event) => {
+      if (this.persistentHighlightsAtTarget(event.target).length) {
+        this._highlightMouseDown = { x: event.clientX, y: event.clientY, time: Date.now() };
+      } else this._highlightMouseDown = null;
+    });
+    this.registerDomEvent(this.content, 'mouseup', () => {
+      if (this._highlightMouseDown && Date.now() - this._highlightMouseDown.time > 600) this._highlightMouseDown = null;
+    });
+    this.registerDomEvent(this.content, 'keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      const persistent = this.persistentHighlightsAtTarget(event.target);
+      if (!persistent.length) return;
+      event.preventDefault(); event.stopPropagation();
+      this.showPersistentHighlightMenu(persistent, { clientX: 0, clientY: 0 });
+    });
+  }
+
+  addSelectionMenuItems(menu, quote, includeQuote) {
+    if (digestIsAndroid()) {
+      menu.addItem((i) => i.setTitle('Digest').setIcon('bookmark-plus').onClick(() => this.saveSelectedDigest(quote, 'quick')));
+      menu.addItem((i) => i.setTitle('Digest with note…').setIcon('file-text').onClick(() => this.saveSelectedDigest(quote, 'review')));
+    }
+    menu.addItem((i) => i.setTitle('Highlight').setIcon('highlighter').onClick(() => this.toggleSelectedHighlight(quote)));
+    menu.addItem((i) => i.setTitle('Copy').setIcon('copy').onClick(() => this.copySelectedText(quote)));
+    if (includeQuote) menu.addItem((i) => i.setTitle('Save quote to Obsidian').setIcon('quote').onClick(() => this.saveSelectedQuote(quote)));
+  }
+
+  async copySelectedText(snapshot) {
+    const quote = snapshot || this.selectedQuote() || this._selectedQuote;
+    if (!quote || quote.file !== this.file) { new Notice(t('quoteSelect')); return false; }
+    try {
+      await this.content.ownerDocument.defaultView.navigator.clipboard.writeText(quote.text);
+      new Notice('Selection copied.');
+      return true;
+    } catch (error) {
+      console.warn('MD Reader: copy failed', error);
+      new Notice('Could not copy the selection. Check clipboard permission and try again.');
+      return false;
+    }
+  }
+
+  async toggleSelectedHighlight(snapshot) {
+    const quote = snapshot || this.selectedQuote() || this._selectedQuote;
+    const isCurrent = () => !!quote && quote.file === this.file && quote.renderGen === this._renderGen &&
+      quote.sourceMtime === this.file?.stat?.mtime && quote.contextRoot === this.content && quote.range && !quote.range.collapsed &&
+      this.content.contains(quote.range.startContainer) && this.content.contains(quote.range.endContainer);
+    if (!isCurrent()) {
+      new Notice('Select text in the current Reader chapter first.'); return null;
+    }
+    try {
+      const record = await this.plugin.persistHighlight(quote, null, isCurrent);
+      if (!record) throw new Error('The annotation file could not be created safely.');
+      const existed = typeof this.plugin.highlightWasExisting === 'function'
+        ? this.plugin.highlightWasExisting(record) : !!this.plugin.lastHighlightWasExisting;
+      if (!existed) new Notice('Highlight saved in Reader Highlights.');
+      else {
+        await this.plugin.removeHighlightRecord(record.id);
+        new Notice('Highlight removed.');
+      }
+      if (isCurrent()) await this.applyPersistentHighlights(this._renderGen);
+      return record;
+    } catch (error) {
+      console.warn('MD Reader: highlight could not be saved', error);
+      new Notice('Could not save the highlight. Check the Reader Highlights folder and retry.');
+      return null;
+    }
+  }
+
+  async applyPersistentHighlights(gen = this._renderGen) {
+    if (!this.file || !this.content || gen !== this._renderGen) return;
+    if (this._digestPreparing) return;
+    const token = this._persistentApplyToken = (this._persistentApplyToken || 0) + 1;
+    const sourcePath = this.file.path;
+    let records;
+    try { records = await this.plugin.highlightsForSource(this.file.path); }
+    catch (error) { console.warn('MD Reader: saved highlights could not be read', error); return; }
+    if (token !== this._persistentApplyToken || gen !== this._renderGen || this.file?.path !== sourcePath || !this.content) return;
+    this.clearPersistentHighlights();
+    const index = readerTextIndex(this.content);
+    if (!index?.text) return;
+    const css = this.content.ownerDocument.defaultView?.CSS;
+    const HighlightCtor = this.content.ownerDocument.defaultView?.Highlight;
+    const intervals = new Map();
+    const recordsForChapter = [];
+    for (const record of records) {
+      const fullDocumentQuote = this.chapters?.length === 1 && normalizeHighlightText(index.text, Math.max(1, index.text.length)) ===
+        normalizeHighlightText(record.quote, DIGEST_TEXT_LIMIT);
+      const candidate = fullDocumentQuote
+        ? [{ start: 0, end: index.text.length, contextMatches: true }]
+        : highlightCandidates(index.text, record);
+      if (candidate.length !== 1) continue;
+      let found = false;
+      for (let si = 0; si < index.segments.length; si++) {
+        const segment = index.segments[si];
+        const from = Math.max(candidate[0].start, segment.start);
+        const to = Math.min(candidate[0].end, segment.start + segment.offsets.length);
+        if (from >= to) continue;
+        const a = segment.offsets[from - segment.start], b = segment.offsets[to - segment.start - 1] + 1;
+        if (a === undefined || !Number.isFinite(b)) continue;
+        const range = this.content.ownerDocument.createRange();
+        range.setStart(segment.node, a); range.setEnd(segment.node, b);
+        found = true;
+        if (!intervals.has(si)) intervals.set(si, []);
+        intervals.get(si).push({ a, b, id: record.id });
+      }
+      if (found) recordsForChapter.push({ record, start: candidate[0].start, end: candidate[0].end });
+    }
+    this._persistentHighlightRecords = recordsForChapter;
+    // Inline targets let document-capture gesture handlers recognize saved
+    // highlights before they claim a tap. Merge overlaps per text node while
+    // preserving every annotation ID on the resulting target.
+    const marks = [];
+    const jobs = [];
+    for (const [si, spans] of intervals) {
+      const segment = index.segments[si];
+      const boundaries = [...new Set(spans.flatMap(({ a, b }) => [a, b]))].sort((a, b) => a - b);
+      const partitions = [];
+      for (let i = 0; i < boundaries.length - 1; i++) {
+        const a = boundaries[i], b = boundaries[i + 1];
+        const ids = new Set(spans.filter((span) => span.a < b && span.b > a).map((span) => span.id));
+        if (!ids.size) continue;
+        const last = partitions[partitions.length - 1];
+        if (last && last.b === a && [...last.ids].sort().join(',') === [...ids].sort().join(',')) last.b = b;
+        else partitions.push({ a, b, ids });
+      }
+      for (const interval of partitions) jobs.push({ segment, ...interval, si });
+    }
+    jobs.sort((a, b) => b.si - a.si || b.a - a.a);
+    for (const { segment, a, b, ids } of jobs) {
+      const range = this.content.ownerDocument.createRange();
+      range.setStart(segment.node, a); range.setEnd(segment.node, b);
+      try {
+        const mark = this.content.ownerDocument.createElement('span');
+        mark.className = 'hr-persistent-highlight';
+        mark.dataset.highlightIds = [...ids].join(',');
+        mark.dataset.readerGestureIgnore = 'true';
+        mark.dataset.ignoreSwipe = 'true';
+        mark.tabIndex = 0;
+        mark.setAttribute('role', 'button');
+        mark.setAttribute('aria-haspopup', 'menu');
+        const labels = recordsForChapter.filter((entry) => ids.has(entry.record.id)).map((entry) => entry.record.quote);
+        mark.setAttribute('aria-label', 'Saved Reader highlight: ' + labels.join(' / ').slice(0, 240));
+        range.surroundContents(mark); marks.push(mark);
+      } catch (_) { /* skip a malformed fragment rather than disturbing layout */ }
+    }
+    this._persistentMarks = marks;
+    this._anchorIndex = null;
+  }
+
+  clearPersistentHighlights() {
+    if (this._cssPersistentHighlight) {
+      try { setDocumentPersistentHighlights(this.content?.ownerDocument, this, []); } catch (_) { /* view is unloading */ }
+      this._cssPersistentHighlight = false;
+    }
+    for (const mark of this._persistentMarks || []) {
+      if (!mark?.parentNode) continue;
+      const parent = mark.parentNode;
+      mark.replaceWith(this.content.ownerDocument.createTextNode(mark.textContent || ''));
+      parent?.normalize?.();
+    }
+    this._persistentMarks = [];
+    this._persistentHighlightRecords = [];
+  }
+
+  persistentHighlightsAtTarget(target) {
+    const mark = target?.closest?.('.hr-persistent-highlight[data-highlight-ids]');
+    if (!mark) return [];
+    const ids = new Set(String(mark.dataset.highlightIds || '').split(',').filter((id) => DIGEST_REQUEST_RE.test(id)));
+    return (this._persistentHighlightRecords || []).filter((entry) => ids.has(entry.record.id));
+  }
+
+  selectedPersistentHighlight(entry) {
+    if (!entry || this.file?.path !== entry.record.source || !this.content?.isConnected) return null;
+    const index = this.textIndex();
+    if (!index || normalizeHighlightText(index.text.slice(entry.start, entry.end), DIGEST_TEXT_LIMIT) !==
+        normalizeHighlightText(entry.record.quote, DIGEST_TEXT_LIMIT)) return null;
+    const first = index.rangeAt(entry.start), last = index.rangeAt(entry.end - 1);
+    if (!first || !last) return null;
+    const range = this.content.ownerDocument.createRange();
+    range.setStart(first.startContainer, first.startOffset);
+    range.setEnd(last.endContainer, last.endOffset);
+    if (normalizeHighlightText(digestSelectionText(range), DIGEST_TEXT_LIMIT) !==
+        normalizeHighlightText(entry.record.quote, DIGEST_TEXT_LIMIT)) return null;
+    const context = digestRangeContext(this.content, range);
+    if (normalizeHighlightText(context.before, 240, true) !== entry.record.before ||
+        normalizeHighlightText(context.after, 240) !== entry.record.after) return null;
+    return { file: this.file, text: entry.record.quote, heading: entry.record.heading || '', range,
+      contextRoot: this.content, renderGen: this._renderGen, sourcePath: this.file.path, sourceMtime: this.file.stat?.mtime };
+  }
+
+  showPersistentHighlightMenu(entries, event) {
+    const valid = (entries || []).filter((entry) => (this._persistentHighlightRecords || []).some((current) =>
+      current.record.id === entry.record.id && current.start === entry.start && current.end === entry.end));
+    if (!valid.length) return false;
+    const menu = new Menu();
+    const counts = new Map();
+    const labels = valid.map(({ record }) => {
+      const excerpt = record.quote.length > 44 ? record.quote.slice(0, 44) + '…' : record.quote;
+      const base = (record.heading || record.source.split('/').pop()) + ' · ' + excerpt;
+      counts.set(base, (counts.get(base) || 0) + 1);
+      return base;
+    });
+    for (let i = 0; i < valid.length; i++) {
+      const entry = valid[i], record = entry.record;
+      const label = counts.get(labels[i]) > 1
+        ? labels[i] + ' · ' + (record.before.slice(-20) || record.after.slice(0, 20) || record.id.slice(0, 8))
+        : labels[i];
+      if (i) menu.addSeparator();
+      if (valid.length > 1) menu.addItem((item) => item.setTitle('Excerpt: ' + label).setIcon('highlighter').onClick(() => {}));
+      menu.addItem((item) => item.setTitle('Copy highlight' + (valid.length > 1 ? ' · ' + label : '')).setIcon('copy')
+        .onClick(() => this.copyPersistentHighlight(record)));
+      menu.addItem((item) => item.setTitle('Remove highlight' + (valid.length > 1 ? ' · ' + label : '')).setIcon('trash-2')
+        .onClick(() => this.removePersistentHighlight(record)));
+      const receipt = this.plugin.localDigestReceipt?.(record.id);
+      if (!receipt && digestIsAndroid()) {
+        menu.addItem((item) => item.setTitle('Digest' + (valid.length > 1 ? ' · ' + label : '')).setIcon('bookmark-plus')
+          .onClick(() => this.digestPersistentHighlight(entry, 'quick')));
+        menu.addItem((item) => item.setTitle('Digest with note…' + (valid.length > 1 ? ' · ' + label : '')).setIcon('file-text')
+          .onClick(() => this.digestPersistentHighlight(entry, 'review')));
+      }
+      if (receipt && digestIsAndroid()) {
+        menu.addItem((item) => item.setTitle('Open Digest in Bridge').setIcon('external-link')
+          .onClick(() => this.openDigestReceipt(receipt)));
+      }
+    }
+    menu.showAtPosition({ x: Number(event?.clientX) || 0, y: Number(event?.clientY) || 0 });
+    return true;
+  }
+
+  async copyPersistentHighlight(record) {
+    try {
+      await this.content.ownerDocument.defaultView.navigator.clipboard.writeText(record.quote);
+      new Notice('Highlight copied.');
+      return true;
+    } catch (error) {
+      console.warn('MD Reader: highlight copy failed', error);
+      new Notice('Could not copy the highlight. Check clipboard permission and try again.');
+      return false;
+    }
+  }
+
+  openDigestReceipt(receipt) {
+    if (!receipt || !DIGEST_REQUEST_RE.test(receipt.request) || !Number.isSafeInteger(receipt.id) || receipt.id < 1 || !digestIsAndroid()) return false;
+    try {
+      const uri = 'supernote-bridge://digest-receipt?request=' + receipt.request + '&id=' + receipt.id;
+      window.open(uri, '_blank');
+      new Notice('Opening Digest #' + receipt.id + ' on this device in Bridge. Use its native Edit control to edit the entry.');
+      return true;
+    } catch (error) {
+      console.warn('MD Reader: Digest receipt could not be opened', error);
+      new Notice('Could not open this local Digest receipt. Open Supernote Bridge on this device.');
+      return false;
+    }
+  }
+
+  async removePersistentHighlight(record) {
+    try {
+      const removed = await this.plugin.removeHighlightRecord(record.id);
+      if (!removed) throw new Error('Highlight record was not found.');
+      new Notice('Highlight removed.');
+      await this.applyPersistentHighlights(this._renderGen);
+      return true;
+    } catch (error) {
+      console.warn('MD Reader: highlight removal failed', error);
+      new Notice('Could not remove this Reader highlight. Check the Reader Highlights folder.');
+      return false;
+    }
+  }
+
+  async digestPersistentHighlight(entry, mode) {
+    const selected = this.selectedPersistentHighlight(entry);
+    if (!selected) { new Notice('This highlight no longer matches the current text. Refresh the chapter before creating a Digest.'); return null; }
+    const previous = this._digestSelection;
+    this._digestSelection = selected;
+    try { return await this.saveSelectedDigest(selected, mode); }
+    finally { if (this._digestSelection === selected) this._digestSelection = previous || null; }
   }
 
   async saveSelectedQuote(snapshot) {
@@ -2664,14 +3199,20 @@ class ReaderView extends ItemView {
 
   digestNotice(message) { new Notice(message); }
 
-  async saveSelectedDigest(snapshot) {
+  async saveSelectedDigest(snapshot, mode = 'review') {
     if (!digestIsAndroid()) return null;
+    mode = mode === 'quick' ? 'quick' : 'review';
     if (this._digestPreparing) return null;
+    const sourceFile = this.file;
+    const sourcePath = sourceFile?.path;
+    const content = this.content;
+    const renderGen = this._renderGen;
     this._digestPreparing = true;
     if (this.digestButton) this.digestButton.disabled = true;
+    if (this.digestReviewButton) this.digestReviewButton.disabled = true;
     try {
       this.digestNotice('Preparing excerpt…');
-      return await this.prepareSelectedDigest(snapshot);
+      return await this.prepareSelectedDigest(snapshot, mode);
     }
     catch (error) {
       console.error('MD Reader: Digest preparation failed', error);
@@ -2680,16 +3221,29 @@ class ReaderView extends ItemView {
     } finally {
       this._digestPreparing = false;
       if (this.digestButton) this.digestButton.disabled = false;
+      if (this.digestReviewButton) this.digestReviewButton.disabled = false;
+      if (this.file === sourceFile && this.file?.path === sourcePath && this.content === content &&
+          this._renderGen === renderGen && this.content?.isConnected) {
+        try { await this.applyPersistentHighlights(renderGen); }
+        catch (error) { console.warn('MD Reader: saved highlights could not be refreshed after Digest preparation', error); }
+      }
     }
   }
 
-  async prepareSelectedDigest(snapshot) {
+  async prepareSelectedDigest(snapshot, mode = 'review') {
     const selected = snapshot || this._digestSelection;
-    const isCurrent = () => !!selected && selected === this._digestSelection && selected.file === this.file &&
+    const isCurrent = () => {
+      const active = this._digestSelection;
+      const sameActiveRange = !!active?.range && !!selected?.range && active.text === selected.text &&
+        active.range.startContainer === selected.range.startContainer && active.range.startOffset === selected.range.startOffset &&
+        active.range.endContainer === selected.range.endContainer && active.range.endOffset === selected.range.endOffset;
+      return !!selected && sameActiveRange && selected.file === this.file &&
       selected.sourcePath === this.file?.path && selected.sourceMtime === this.file?.stat?.mtime &&
       selected.renderGen === this._renderGen && selected.range && !selected.range.collapsed &&
+      selected.contextRoot === this.content &&
       typeof this.content?.contains === 'function' && this.content.contains(selected.range.startContainer) &&
       this.content.contains(selected.range.endContainer);
+    };
     if (!isCurrent()) { this.digestNotice('Select text in the current Reader chapter first.'); return null; }
     let managed;
     try { managed = await this.isManagedTranscript(); }
@@ -2742,6 +3296,9 @@ class ReaderView extends ItemView {
       return null;
     }
     if (!isCurrent()) { this.digestNotice('The Reader source changed before Digest handoff. Select the text again.'); return null; }
+    const annotation = await this.plugin.persistHighlight(selected, note, isCurrent);
+    if (!annotation) { this.digestNotice('Could not safely save this excerpt in Reader Highlights. Check its folder and select the text again.'); return null; }
+    if (!isCurrent()) { this.digestNotice('The Reader source changed while saving the highlight. Select the text again.'); return null; }
     const payload = { version: 1, requestId: '', text: selected.text, origin };
     if (note) payload.note = note;
     let json;
@@ -2754,16 +3311,37 @@ class ReaderView extends ItemView {
       this.digestNotice('Could not prepare the Digest request on this device.'); return null;
     }
     if (json.length > DIGEST_JSON_LIMIT) { this.digestNotice('This Digest request is too large. Select a shorter passage.'); return null; }
-    const uri = 'supernote-bridge://digest?payload=' + encodeURIComponent(json);
-    if (uri.length > DIGEST_URI_LIMIT) { this.digestNotice('This Digest request is too large to open. Select a shorter passage.'); return null; }
     let storage;
     try { storage = window.localStorage; } catch (_) { storage = null; }
     const state = readDigestState(vault, storage);
     const existingStatus = state.requests[payload.requestId];
     if (existingStatus === 'saved') {
+      let receipt = null;
+      try { receipt = this.plugin.localDigestReceipt?.(annotation.id) || null; }
+      catch (error) { console.warn('MD Reader: local Digest receipt could not be read', error); }
+      if (receipt?.request === payload.requestId) {
+        return this.openDigestReceipt(receipt) ? payload.requestId : null;
+      }
+    }
+    let query = 'mode=review';
+    let quickEnvelope = null;
+    if (mode === 'quick') {
+      try {
+        quickEnvelope = await makeQuickEnvelope(vault, json, payload.requestId, digestLocalStorage());
+        query = quickEnvelope.query;
+      } catch (error) {
+        console.warn('MD Reader: quick Digest signing failed', error);
+        this.digestNotice('Quick Digest setup failed. Use “Digest with note…” or check secure local storage.'); return null;
+      }
+      if (!isCurrent()) { this.digestNotice('The Reader source changed before Digest handoff. Select the text again.'); return null; }
+    }
+    const uri = 'supernote-bridge://digest?' + query + '&payload=' + encodeURIComponent(json);
+    if (uri.length > DIGEST_URI_LIMIT) { this.digestNotice('This Digest request is too large to open. Select a shorter passage.'); return null; }
+    if (existingStatus === 'saved') {
       try {
         this.digestNotice('Opening saved Digest in Bridge.');
         window.open(uri, '_blank');
+        void this.applyPersistentHighlights(this._renderGen);
         return payload.requestId;
       } catch (error) {
         console.warn('MD Reader: saved Digest could not be reopened in Supernote Bridge', error);
@@ -2772,19 +3350,36 @@ class ReaderView extends ItemView {
       }
     }
     if (existingStatus === 'uncertain') {
-      this.digestNotice('Check Supernote Digests before retrying this uncertain request.'); return null;
+      this.digestNotice('This request may already have been written. Check Supernote Digests; this request will not be sent again.'); return null;
+    }
+    if (typeof this.plugin.associateDigestAnnotation !== 'function' ||
+        !this.plugin.associateDigestAnnotation(vault, payload.requestId, annotation.id)) {
+      this.digestNotice('Reader could not link this excerpt to its local Digest receipt. Check local storage and try again.');
+      return null;
     }
     state.requests[payload.requestId] = 'pending';
     if (!writeDigestState(vault, storage, state)) {
       this.digestNotice('Reader could not save the local Digest request state. Enable local storage and try again.'); return null;
     }
+    if (quickEnvelope) {
+      const quickPending = readQuickPending(vault, storage);
+      quickPending[payload.requestId] = quickEnvelope.credentials.client;
+      if (!writeQuickPending(vault, storage, quickPending)) {
+        delete state.requests[payload.requestId]; writeDigestState(vault, storage, state);
+        this.digestNotice('Reader could not save local Quick Digest state. Use “Digest with note…” instead.'); return null;
+      }
+    }
     try {
       window.open(uri, '_blank');
-      this.digestNotice('Review and save in Supernote Bridge. Reader will report success only after Bridge confirms it.');
+      const dispatchNotice = mode === 'quick'
+        ? (quickEnvelope?.credentials.trusted ? 'Saving Digest in Bridge…' : 'Confirm one-time Quick Digest access in Bridge.')
+        : 'Review and save in Supernote Bridge. Reader will report success only after Bridge confirms it.';
+      this.digestNotice(dispatchNotice + ' If Bridge does not open, install or update it and retry.');
+      void this.applyPersistentHighlights(this._renderGen);
       return payload.requestId;
     } catch (error) {
       console.warn('MD Reader: Supernote Bridge could not be opened', error);
-      this.digestNotice('Supernote Bridge did not open. Install or update it, then retry this selection.');
+      this.digestNotice('Could not dispatch the Digest link. Install or update Supernote Bridge, then retry this selection.');
       return null;
     }
   }
@@ -3119,7 +3714,7 @@ class ReaderView extends ItemView {
     const s = this.plugin.settings;
     // не сохранять, пока вьюпорт не измерен: до первого замера totalPages=1/page=0,
     // и запись затёрла бы реальную закладку нулём при быстром закрытии/переключении
-    if (!this._measured || this._blockReady === false) return;
+    if (!this._measured || this._blockReady === false || !this.readerLayoutReady()) return;
     // позиция ещё восстанавливается (ждём догрузки картинок) — не затирать сохранённую
     if (this._pendingAnchor || this._pendingFraction || this._pendingHeading || this._pendingFind) return;
     // Keep the original character through successive reflows, rather than
@@ -3137,6 +3732,12 @@ class ReaderView extends ItemView {
     if (prev && Array.isArray(prev.b) && prev.b.length) rec.b = prev.b;
     this.plugin.db[this.file.path] = rec;
     this.plugin._dirty = true;
+  }
+
+  readerLayoutReady() {
+    if (!this.content || !this.viewport) return false;
+    const style = getComputedStyle(this.content);
+    return style.columnFill === 'auto' && this.viewport.clientHeight > 0 && this.content.clientHeight > 0;
   }
 
   applySettings() {
@@ -3419,18 +4020,20 @@ class ReaderView extends ItemView {
     const OS_EDGE = 12, SWIPE = 45, CLAIM = 6, TAP_MOVE = 10, TAP_MS = 300;
     let x0 = 0, y0 = 0, t0 = 0, dragging = false, decided = false, horizontal = false;
     let bottomStart = false, menuSwipe = false;
+    let highlightTap = null;
     let pinch = null; // {d0, base} — щипок меняет размер шрифта, а не масштаб окна
 
     const abortDrag = () => {
       if (dragging) {
         dragging = false; decided = false; horizontal = false; bottomStart = false; menuSwipe = false;
+        highlightTap = null;
         this.content.style.transition = this.plugin.settings.animate ? 'transform 0.2s ease' : 'none';
         this.applyTransform();
       }
     };
 
     const interactive = (tg) => !!(tg && tg.closest && tg.closest(
-      'a, input, button, textarea, select, [contenteditable], .task-list-item-checkbox, .callout-fold, .footnote-link, audio, video, .hr-ui, .hr-end, .hr-fn, .hr-fn-pop'
+      'a, input, button, textarea, select, [contenteditable], [data-reader-gesture-ignore], .task-list-item-checkbox, .callout-fold, .footnote-link, audio, video, .hr-ui, .hr-reader-selection-actions, .hr-end, .hr-fn, .hr-fn-pop'
     ));
 
     this._snAbortDrag = abortDrag;
@@ -3442,10 +4045,15 @@ class ReaderView extends ItemView {
         return;
       }
       if (e.touches.length !== 1) { abortDrag(); return; }
+      const markedHighlights = this.persistentHighlightsAtTarget(e.target);
+      highlightTap = markedHighlights.length ? { entries: markedHighlights, x: e.touches[0].clientX,
+        y: e.touches[0].clientY, time: Date.now() } : null;
       // палец лёг на полосу перемотки — тянут её, а не страницу
       if (e.target && e.target.closest && e.target.closest('.hr-scrub')) { abortDrag(); return; }
       // в окне сноски палец прокручивает саму сноску, а не листает книгу
       if (e.target && e.target.closest && e.target.closest('.hr-fn-pop')) { abortDrag(); return; }
+      // The selection dock, including its padded gutters, is a control surface.
+      if (interactive(e.target) && !markedHighlights.length) { abortDrag(); return; }
       const tc = e.touches[0];
       const win = (vp.ownerDocument && vp.ownerDocument.defaultView) || window;
       if (Math.min(tc.clientX, win.innerWidth - tc.clientX) < OS_EDGE) { abortDrag(); return; }
@@ -3498,7 +4106,16 @@ class ReaderView extends ItemView {
       const dx = tc.clientX - x0, dy = tc.clientY - y0, dt = Date.now() - t0;
       const selection = vp.ownerDocument.getSelection();
       if (selection && !selection.isCollapsed && this.content.contains(selection.anchorNode)) {
+        highlightTap = null;
         decided = false; horizontal = false; menuSwipe = false; this.applyTransform(); return;
+      }
+      const tap = highlightTap; highlightTap = null;
+      if (tap && Math.abs(dx) < TAP_MOVE && Math.abs(dy) < TAP_MOVE && dt < TAP_MS) {
+        e.preventDefault(); e.stopPropagation();
+        this._ignoreNextHighlightClickUntil = Date.now() + 800;
+        this.showPersistentHighlightMenu(tap.entries, { clientX: tc.clientX, clientY: tc.clientY });
+        decided = false; horizontal = false; menuSwipe = false; bottomStart = false;
+        this.applyTransform(); return;
       }
       if (menuSwipe) {
         const open = dy <= -SWIPE && Math.abs(dy) > Math.abs(dx) * 1.5;
@@ -3523,8 +4140,8 @@ class ReaderView extends ItemView {
       }
       decided = false; horizontal = false;
     };
-    this.registerDomEvent(vp, 'touchend', endTouch, { capture: true, passive: true });
-    this.registerDomEvent(vp, 'touchcancel', () => { pinch = null; abortDrag(); }, { capture: true, passive: true });
+    this.registerDomEvent(vp, 'touchend', endTouch, { capture: true, passive: false });
+    this.registerDomEvent(vp, 'touchcancel', () => { pinch = null; highlightTap = null; abortDrag(); }, { capture: true, passive: true });
 
     // мышью по странице ещё и ВЫДЕЛЯЮТ текст: клик в конце протяжки не должен
     // листать (иначе выделил цитату — и уехал со страницы)
@@ -3779,6 +4396,20 @@ class ReaderSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName(t('quoteFolderName')).setDesc(t('quoteFolderDesc'))
       .addText((tx) => tx.setPlaceholder(DEFAULT_SETTINGS.quoteFolder).setValue(this.plugin.settings.quoteFolder)
         .onChange((value) => { this.plugin.settings.quoteFolder = value.trim(); this.plugin.queueSave(); }));
+
+    new Setting(containerEl).setName('Reader Highlights')
+      .setDesc('Reader-owned annotation files are stored here and synced with the vault. The folder is fixed so saved highlights remain discoverable.')
+      .addButton((button) => button.setButtonText('Open Highlights').onClick(() => this.plugin.openHighlights()));
+
+    if (digestIsAndroid()) {
+      new Setting(containerEl).setName(t('nativeDigestSettings')).setDesc(t('digestDefaultsHint'))
+        .addButton((button) => button.setButtonText(t('configureDigestDefaults')).onClick(() => {
+          try { window.open('supernote-bridge://digest-settings'); }
+          catch (error) { new Notice('Supernote Bridge did not open. Install or update it, then retry.'); }
+        }))
+        .addButton((button) => button.setButtonText('Reconnect Quick Digest').setTooltip('Reset local trust so Bridge can ask permission again.')
+          .onClick(() => this.plugin.reconnectQuickDigest()));
+    }
 
     new Setting(containerEl)
       .setName(t('sImportNow'))
@@ -4793,6 +5424,7 @@ class MdReaderPlugin extends Plugin {
     // «в памяти есть несохранённое»: без него автосохранение каждые две секунды
     // сериализовало всю базу позиций впустую — даже когда ридер закрыт
     this._dirty = false;
+    this._highlightCache = new Map();
 
     if (typeof this.registerObsidianProtocolHandler === 'function') {
       this.registerObsidianProtocolHandler(DIGEST_RESULT_ACTION, (params) => this.handleDigestResult(params));
@@ -4841,6 +5473,7 @@ class MdReaderPlugin extends Plugin {
     readerCmd('prev-chapter', t('cmdPrevChapter'), (v) => v.stepChapter(-1));
     readerCmd('edit-note', t('cmdEdit'), (v) => v.openInEditor());
     readerCmd('save-quote', t('quoteSave'), (v) => v.saveSelectedQuote());
+    readerCmd('open-highlights', 'Open Reader Highlights', () => this.openHighlights());
     readerCmd('exit-reader', t('cmdExit'), (v) => this.exitReader(v.leaf));
     readerCmd('jump-back', t('menuBack'), (v) => v.jumpBack());
     readerCmd('font-bigger', t('cmdFontBigger'), () => this.stepFontSize(1));
@@ -4879,6 +5512,8 @@ class MdReaderPlugin extends Plugin {
     this.registerEvent(this.app.workspace.on('active-leaf-change', (leaf) => this.applyImmersive(leaf)));
 
     this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+      this._highlightCache?.delete(oldPath);
+      this._highlightCache?.delete(file.path);
       // перенести сохранённые позиции: сам объект и (если переименовали ПАПКУ) файлы внутри
       const move = (from, to) => { if (this.db[from]) { this.db[to] = this.db[from]; delete this.db[from]; } };
       move(oldPath, file.path);
@@ -4896,16 +5531,24 @@ class MdReaderPlugin extends Plugin {
         const v = l.view;
         if (v && v.file) v.filePath = v.file.path;
       });
+      if (this.isHighlightPath(oldPath) || this.isHighlightPath(file.path)) this.refreshHighlightOverlays();
     }));
     // заметку правят в соседней вкладке — ридер догоняет, а не показывает старый текст
     this.registerEvent(this.app.vault.on('modify', (file) => {
+      if (this.isHighlightPath(file.path)) { this._highlightCache?.delete(file.path); if (!this._writingHighlightIds?.size) this.refreshHighlightOverlays(); return; }
       this.app.workspace.getLeavesOfType(VIEW_TYPE_READER).forEach((l) => {
         // у отложенной (ещё не открытой) вкладки вместо вьюхи заглушка — instanceof обязателен
         const v = l.view;
         if (v instanceof ReaderView && v.file === file) v.scheduleReload();
       });
     }));
+    this.registerEvent(this.app.vault.on('create', (file) => {
+      this._highlightCache?.delete(file.path);
+      if (this.isHighlightPath(file.path) && !this._writingHighlightIds?.size) this.refreshHighlightOverlays();
+    }));
     this.registerEvent(this.app.vault.on('delete', (file) => {
+      this._highlightCache?.delete(file.path);
+      if (this.isHighlightPath(file.path)) this.refreshHighlightOverlays();
       if (this.db[file.path]) delete this.db[file.path];
       this.library = this.library.filter((p) => p !== file.path && !p.startsWith(file.path + '/'));
       // если удалённая заметка открыта в ридере — прервать идущий рендер (иначе он
@@ -4922,8 +5565,8 @@ class MdReaderPlugin extends Plugin {
           v.toc = [];
           v._selectedQuote = null;
           v._digestSelection = null;
-          if (v.quoteButton) v.quoteButton.hidden = true;
-          if (v.digestButton) v.digestButton.hidden = true;
+          v.hideSelectionActions?.();
+          v.clearPersistentHighlights?.();
           if (v.clearCache) v.clearCache();
           if (v.content) { v.content.empty(); v.content.createDiv('hr-empty').setText(t('notFound')); }
         }
@@ -4938,6 +5581,41 @@ class MdReaderPlugin extends Plugin {
     }, 2000));
   }
 
+  reconnectQuickDigest() {
+    const vault = digestVaultName(this.app);
+    if (!vault || !resetQuickCredentials(vault, digestLocalStorage())) {
+      new Notice('Could not reset local Quick Digest access. Check this device’s local storage.'); return false;
+    }
+    new Notice('Quick Digest access reset. The next quick save will ask Bridge to confirm permission again.');
+    return true;
+  }
+
+  localDigestReceipt(annotationId) {
+    if (!DIGEST_REQUEST_RE.test(String(annotationId || ''))) return null;
+    const vault = digestVaultName(this.app);
+    return vault ? readDigestAnnotationLinks(vault, digestLocalStorage()).receipts[annotationId] || null : null;
+  }
+
+  associateDigestAnnotation(vault, request, annotationId) {
+    if (!vault || !DIGEST_REQUEST_RE.test(String(request || '')) || !DIGEST_REQUEST_RE.test(String(annotationId || ''))) return false;
+    const storage = digestLocalStorage();
+    const links = readDigestAnnotationLinks(vault, storage);
+    links.pending[request] = annotationId;
+    return writeDigestAnnotationLinks(vault, storage, links);
+  }
+
+  completeDigestAnnotation(vault, request, status, id) {
+    const storage = digestLocalStorage();
+    const links = readDigestAnnotationLinks(vault, storage);
+    const annotation = links.pending[request];
+    if (!annotation) return true; // legacy or pre-association Reader request
+    delete links.pending[request];
+    if (status === 'saved' && DIGEST_REQUEST_RE.test(annotation) && Number.isSafeInteger(id) && id > 0) {
+      links.receipts[annotation] = { request, id };
+    }
+    return writeDigestAnnotationLinks(vault, storage, links);
+  }
+
   handleDigestResult(params) {
     try {
       const result = validateDigestResult(params);
@@ -4947,11 +5625,39 @@ class MdReaderPlugin extends Plugin {
       let storage;
       try { storage = window.localStorage; } catch (_) { storage = null; }
       const state = readDigestState(vault, storage);
-      if (state.requests[result.requestId] !== 'pending') return false;
+      const linksBefore = readDigestAnnotationLinks(vault, storage);
+      const retryingReceiptLink = state.requests[result.requestId] === 'saved' && result.status === 'saved' &&
+        Object.values(linksBefore.receipts).some((receipt) => receipt.request === result.requestId && receipt.id === result.id);
+      if (state.requests[result.requestId] !== 'pending' && !retryingReceiptLink) return false;
+      const quickPending = readQuickPending(vault, storage);
+      let quickCredentials = null;
+      const pendingQuickClient = quickPending[result.requestId];
+      if (result.quick !== null) {
+        if (result.status !== 'saved') return false;
+        const pending = { vault, requestId: result.requestId, client: pendingQuickClient };
+        quickCredentials = readQuickCredentials(vault, storage);
+        if (!validQuickCallback(params, pending) || quickCredentials?.client !== result.quick) return false;
+      }
+      // Entry IDs belong to this device's local Bridge ledger. Keep the optional
+      // annotation-to-receipt link in local storage, never in synced Markdown.
+      // Commit this required association first. If the write fails, the request
+      // remains pending and Bridge can replay its callback without another insert.
+      if (!this.completeDigestAnnotation(vault, result.requestId, result.status, result.id)) return false;
       state.requests[result.requestId] = result.status;
       if (!writeDigestState(vault, storage, state)) return false;
+      // The receipt ledger is authoritative and is written before optional auth
+      // bookkeeping. A failed cleanup must not lose a durable Reader receipt.
+      if (pendingQuickClient) {
+        if (!quickCredentials) quickCredentials = readQuickCredentials(vault, storage);
+        if (quickCredentials && quickCredentials.client === pendingQuickClient) {
+          quickCredentials.trusted = result.quick !== null;
+          try { storage?.setItem(quickStoreKey(vault), JSON.stringify(quickCredentials)); } catch (_) { /* next quick action can still send setup */ }
+        }
+        delete quickPending[result.requestId];
+        writeQuickPending(vault, storage, quickPending);
+      }
       if (result.status === 'saved') new Notice('Supernote Bridge confirmed Digest #' + result.id + '.');
-      else if (result.status === 'uncertain') new Notice('Bridge could not confirm this Digest. Check Supernote Digests before retrying.');
+      else if (result.status === 'uncertain') new Notice('Bridge could not confirm this Digest. Check Supernote Digests; this request will not be sent again.');
       else new Notice('Digest capture was cancelled. Select the passage again to retry.');
       return true;
     } catch (error) {
@@ -5116,6 +5822,127 @@ class MdReaderPlugin extends Plugin {
     return operation;
   }
 
+  highlightFolderPath() { return 'Reader Highlights'; }
+
+  async ensureVaultFolder(path) {
+    let current = '';
+    for (const part of path.split('/')) {
+      current = current ? current + '/' + part : part;
+      if (this.app.vault.getAbstractFileByPath(current)) continue;
+      try { await this.app.vault.createFolder(current); }
+      catch (error) { if (!this.app.vault.getAbstractFileByPath(current)) throw error; }
+    }
+  }
+
+  async persistHighlight(selected, note, stillCurrent = () => true) {
+    if (!selected || !digestSafeVaultPath(selected.sourcePath) || !selected.text || selected.text.length > DIGEST_TEXT_LIMIT) return null;
+    const context = digestRangeContext(selected.contextRoot, selected.range);
+    const record = { version: 1, source: selected.sourcePath, quote: selected.text,
+      before: normalizeHighlightText(context.before, 240), after: normalizeHighlightText(context.after, 240), created: new Date().toISOString() };
+    const heading = normalizeHighlightText(selected.heading, 256);
+    if (heading) record.heading = heading;
+    if (note?.fileId) record.fileId = note.fileId;
+    if (Array.isArray(note?.pageIds) && note.pageIds.length) record.pageIds = [...note.pageIds];
+    const identity = { source: record.source, quote: record.quote, before: record.before, after: record.after };
+    const id = await highlightIdentityId(identity);
+    if (!stillCurrent()) return null;
+    record.id = id;
+    const folder = this.highlightFolderPath(), path = folder + '/' + id + '.md';
+    const acceptExisting = async (file) => {
+      if (!(file instanceof TFile)) throw new Error('Highlight path is occupied by a folder');
+      const existing = parseHighlightRecord(await this.app.vault.cachedRead(file));
+      const valid = existing && existing.id === id &&
+        await highlightIdentityId({ source: existing.source, quote: existing.quote, before: existing.before, after: existing.after }) === id;
+      if (!valid) throw new Error('Highlight path contains an unrecognized file');
+      return this.rememberHighlightDisposition(existing, true);
+    };
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (existing) return acceptExisting(existing);
+    if (!stillCurrent()) return null;
+    await this.ensureVaultFolder(folder);
+    if (!stillCurrent()) return null;
+    try {
+      this._writingHighlightIds ||= new Set();
+      this._writingHighlightIds.add(id);
+      await this.app.vault.create(path, highlightRecordMarkdown(record));
+      return this.rememberHighlightDisposition(record, false);
+    } catch (error) {
+      const collision = this.app.vault.getAbstractFileByPath(path);
+      if (!collision) throw error;
+      try { return await acceptExisting(collision); } catch (_) { throw error; }
+    } finally {
+      this._writingHighlightIds?.delete(id);
+    }
+  }
+
+  rememberHighlightDisposition(record, existed) {
+    this._highlightDispositions ||= new WeakMap();
+    this._highlightDispositions.set(record, !!existed);
+    return record;
+  }
+
+  highlightWasExisting(record) {
+    return this._highlightDispositions?.get(record) === true;
+  }
+
+  async highlightsForSource(source) {
+    const all = await this.allHighlights();
+    const unique = new Map();
+    for (const entry of all) if (entry.record.source === source && !unique.has(entry.record.id)) unique.set(entry.record.id, entry.record);
+    return [...unique.values()];
+  }
+
+  async readHighlightRecordCached(file) {
+    const mtime = Number(file.stat?.mtime) || 0, size = Number(file.stat?.size) || 0;
+    if (size > 256 * 1024) return null;
+    const cached = this._highlightCache?.get(file.path);
+    if (cached && cached.mtime === mtime && cached.size === size) return cached.record;
+    let record = null;
+    try {
+      record = parseHighlightRecord(await this.app.vault.cachedRead(file));
+      if (record && await highlightIdentityId({ source: record.source, quote: record.quote, before: record.before, after: record.after }) !== record.id) record = null;
+    } catch (_) { record = null; }
+    this._highlightCache ||= new Map();
+    this._highlightCache.set(file.path, { mtime, size, record });
+    return record;
+  }
+
+  async allHighlights() {
+    const root = this.app.vault.getAbstractFileByPath(this.highlightFolderPath());
+    if (!(root instanceof TFolder)) return [];
+    const files = [];
+    (root.children || []).forEach((entry) => { if (entry instanceof TFile && entry.extension === 'md') files.push(entry); });
+    const out = [];
+    for (let i = 0; i < files.length; i += 32) {
+      const batch = files.slice(i, i + 32);
+      const records = await Promise.all(batch.map((file) => this.readHighlightRecordCached(file)));
+      records.forEach((record, j) => { if (record) out.push({ record, file: batch[j] }); });
+    }
+    return out;
+  }
+
+  async removeHighlightRecord(id) {
+    if (!DIGEST_REQUEST_RE.test(String(id || ''))) return false;
+    const duplicates = (await this.allHighlights()).filter((entry) => entry.record.id === id);
+    if (!duplicates.length) return false;
+    for (const { file } of duplicates) {
+      if (typeof this.app.vault.trash === 'function') await this.app.vault.trash(file, true);
+      else await this.app.vault.delete(file);
+    }
+    return true;
+  }
+
+  refreshHighlightOverlays(source) {
+    this.app.workspace.getLeavesOfType(VIEW_TYPE_READER).forEach((leaf) => {
+      const view = leaf.view;
+      if (view instanceof ReaderView && (!source || view.file?.path === source)) void view.applyPersistentHighlights(view._renderGen);
+    });
+  }
+
+  isHighlightPath(path) { return typeof path === 'string' && (path === this.highlightFolderPath() || path.startsWith(this.highlightFolderPath() + '/')); }
+
+  openHighlights() { new HighlightManagerModal(this.app, this).open(); }
+
   /* ---------- library ---------- */
 
   openLibrary() { new LibraryModal(this.app, this).open(); }
@@ -5126,6 +5953,7 @@ class MdReaderPlugin extends Plugin {
     const seen = new Set();
     let quotesPath = '';
     try { quotesPath = normalizeQuoteFolder(this.settings.quoteFolder).toLowerCase(); } catch (_) { /* invalid setting is reported on save */ }
+    const highlightsPath = this.highlightFolderPath().toLowerCase();
     // пустая настройка = корень vault; его НЕ листаем — там весь vault, а не библиотека.
     // Ищем без учёта регистра: «books» в настройке и «Books» в хранилище — одна папка
     const folder = this.settings.importFolder ? this.resolvePath(this.settings.importFolder) : null;
@@ -5133,8 +5961,9 @@ class MdReaderPlugin extends Plugin {
       // вместе с подпапками: книги удобно раскладывать по авторам/сериям.
       // Папки картинок (…​.assets) пропускаем — .md там всё равно нет
       const walk = (dir) => dir.children.forEach((f) => {
-        if (f instanceof TFolder) { if (!f.name.endsWith('.assets') && f.path.toLowerCase() !== quotesPath) walk(f); }
+        if (f instanceof TFolder) { if (!f.name.endsWith('.assets') && f.path.toLowerCase() !== quotesPath && f.path.toLowerCase() !== highlightsPath) walk(f); }
         else if (f instanceof TFile && f.extension === 'md') {
+          if (f.path.toLowerCase().startsWith(highlightsPath + '/')) return;
           const cache = this.app.metadataCache && this.app.metadataCache.getFileCache(f);
           if (cache && cache.frontmatter && cache.frontmatter['md-reader-source']) return;
           out.push({ file: f, registered: false }); seen.add(f.path);
@@ -5143,6 +5972,7 @@ class MdReaderPlugin extends Plugin {
       walk(folder);
     }
     this.library.forEach((p) => {
+      if (p.toLowerCase() === highlightsPath || p.toLowerCase().startsWith(highlightsPath + '/')) return;
       if (seen.has(p)) return;
       const f = this.app.vault.getAbstractFileByPath(p);
       if (f instanceof TFile) { out.push({ file: f, registered: true }); seen.add(p); }
@@ -5152,6 +5982,7 @@ class MdReaderPlugin extends Plugin {
     // (v1.1) его нет, и «недавним» такое называть нечестно
     const recents = [];
     Object.keys(this.db).forEach((p) => {
+      if (p.toLowerCase() === highlightsPath || p.toLowerCase().startsWith(highlightsPath + '/')) return;
       if (seen.has(p)) return;
       const rec = this.db[p];
       if (!rec || !rec.t) return;
