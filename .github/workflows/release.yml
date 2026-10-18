@@ -12,6 +12,8 @@ permissions:
 
 jobs:
   release:
+    # Fork releases are prepared and published manually; keep this upstream-only.
+    if: github.repository == 'mrrepac/obsidian-md-reader'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

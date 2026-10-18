@@ -11,6 +11,8 @@ const css = readFileSync(join(__dirname, '../styles.css'), 'utf8');
   const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined });
   try {
     const page = await browser.newPage({ viewport: { width: 1100, height: 780 } });
+    const pageErrors = [];
+    page.on('pageerror', error => pageErrors.push(error.message));
     await page.setContent(`<style>
       * { box-sizing: border-box; } body { margin: 0; font: 18px Georgia; }
       body { --font-text: Georgia; --font-text-size: 18px; --background-primary: #faf8f3;
@@ -88,7 +90,8 @@ const css = readFileSync(join(__dirname, '../styles.css'), 'utf8');
       }
       class Menu {
         addItem(cb) { const item = { setTitle() { return item; }, setIcon() { return item; }, onClick() { return item; } }; cb(item); }
-        addSeparator() {} showAtPosition(p) { window.menuPosition = p; }
+        addSeparator() {} onHide(callback) { this.hideCallback = callback; return this; }
+        showAtPosition(p) { window.menuPosition = p; }
       }
       const api = new Proxy({ ItemView, Modal, Setting, Menu, TFile,
         Platform: { isDesktop: true, isMobile: false },
@@ -246,7 +249,7 @@ const css = readFileSync(join(__dirname, '../styles.css'), 'utf8');
     await page.evaluate(() => lastModal.close());
     await page.getByRole('button', { name: 'Navigation', exact: true }).focus();
     await page.keyboard.press('Enter');
-    await check('menu opens at its visible button from the keyboard', () => !!window.menuPosition && menuPosition.y > 100);
+    await check('menu opens at its visible button from the keyboard', () => !!window.menuPosition && window.menuPosition.y > 100);
     await page.evaluate(async () => { plugin.db['book.md'] = { g: 0.4, b: [{ g: 0.2, label: 'Old bookmark' }] }; await view.renderFile(); });
     await page.waitForTimeout(350);
     await check('legacy positions and bookmarks still load', () => Math.abs(view.currentG() - 0.4) < 0.05 && view.bookmarks()[0].label === 'Old bookmark');
@@ -297,6 +300,7 @@ const css = readFileSync(join(__dirname, '../styles.css'), 'utf8');
     });
     await check('issue #1: closing during a read also preserves saved progress', () =>
       JSON.stringify(plugin.db['book.md']) === JSON.stringify(beforeInterruptedRead) && !view.content.isConnected && view.content.innerHTML === beforeInterruptedMarkup);
+    if (pageErrors.length) throw new Error(`Unexpected browser errors: ${pageErrors.join(' | ')}`);
     console.log(`${results.length} reading integration checks passed`);
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

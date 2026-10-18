@@ -156,13 +156,16 @@ The Community Plugins catalog installs upstream MD Reader by mrrepac. It does no
 
 ### Install this fork manually
 
-Download or clone this repository, then copy exactly these three plugin files into your vault's plugin folder:
+Download `md-reader-2.1.2.zip` from the [Supernote fork prerelease](https://github.com/ofples/obsidian-md-reader/releases/tag/v2.1.2), extract it, and copy the `md-reader` folder into your vault's plugin folder. The ZIP is ready to install; no build step is needed. It contains these four files:
 
 ```text
 main.js
 manifest.json
 styles.css
+LICENSE
 ```
+
+To install manually from source instead, download or clone this repository and use the same four files.
 
 The folder is `<your vault>/.obsidian/plugins/md-reader/` (or the active configuration folder's `plugins/md-reader/`). In Obsidian, reload the app if needed, then enable **MD Reader** in Settings → Community plugins. When replacing an existing upstream installation, replace only those three files and preserve `data.json`; settings, reading positions and bookmarks use the same plugin ID and data format.
 

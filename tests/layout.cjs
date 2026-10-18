@@ -55,11 +55,9 @@ const css = readFileSync(join(root, 'styles.css'), 'utf8');
             const vp = view.viewport.getBoundingClientRect();
             const stage = view.stage.getBoundingClientRect();
             const content = view.content.getBoundingClientRect();
-            const style = getComputedStyle(view.content);
-            const footer = view.statusBar.getBoundingClientRect();
             return {
               left: stage.left - vp.left, right: vp.right - stage.right,
-              footerClearance: parseFloat(style.paddingBottom) - footer.height,
+              verticalPadding: parseFloat(getComputedStyle(view.content).paddingBottom),
               stageWidth: stage.width, contentWidth: content.width, pages: view.totalPages,
             };
           }, { source, variant, mode });
@@ -67,7 +65,7 @@ const css = readFileSync(join(root, 'styles.css'), 'utf8');
           try {
             assert.ok(result.left >= -1 && result.right >= -1, 'page must fit the viewport');
             assert.ok(Math.abs(result.left - result.right) < 1, 'side margins must be symmetric');
-            assert.ok(result.footerClearance >= 3.5, 'text must clear the footer by 4px');
+            assert.equal(result.verticalPadding, 0, 'content must honor the configured zero vertical padding');
             assert.ok(Math.abs(result.stageWidth - result.contentWidth) < 1, 'column container must match the book');
             assert.ok(result.pages > 1 && Number.isFinite(result.pages), 'long text must paginate');
           } catch (error) { failures.push({ theme, width, mode, variant, reason: error.message, ...result }); }
@@ -75,22 +73,35 @@ const css = readFileSync(join(root, 'styles.css'), 'utf8');
         }
       }
     }
-    // A footer can grow without a viewport resize. Exercise the real observer
-    // and debounce instead of manually calling applySettings a second time.
+    // The status bar overlays the page. A font-driven height change should not
+    // reserve new page space or move/reflow the book.
     const dynamic = await page.evaluate(async () => {
       const view = window.layoutTestView;
       view.app = { workspace: { on() {} } };
-      view.registerEvent = () => {};
+      view._layoutTestDisposers = [];
+      view.registerEvent = dispose => { if (typeof dispose === 'function') view._layoutTestDisposers.push(dispose); };
+      view.registerDomEvent = (target, type, listener, options) => {
+        target.addEventListener(type, listener, options);
+        view.registerEvent(() => target.removeEventListener(type, listener, options));
+      };
       view.setupRepagination();
+      const geometry = () => ({
+        page: view.page, pages: view.totalPages,
+        width: view.content.getBoundingClientRect().width,
+        height: view.content.getBoundingClientRect().height,
+        paddingBottom: getComputedStyle(view.content).paddingBottom,
+      });
+      const before = geometry();
       view.statusBar.style.fontSize = '40px';
       await new Promise(resolve => setTimeout(resolve, 450));
-      const clearance = parseFloat(getComputedStyle(view.content).paddingBottom) - view.statusBar.offsetHeight;
+      const after = geometry();
       view.ro.disconnect();
       clearTimeout(view._repaginateTimer);
-      return clearance;
+      for (const dispose of view._layoutTestDisposers) dispose();
+      return { before, after, unchanged: JSON.stringify(before) === JSON.stringify(after) };
     });
     checks++;
-    if (dynamic < 3.5) failures.push({ reason: 'footer resize must update bottom clearance', clearance: dynamic });
+    if (!dynamic.unchanged) failures.push({ reason: 'overlay status-bar resize must not reflow page geometry', ...dynamic });
     // Mobile host rules from Obsidian 1.14.2: showing controls must not move
     // or repaginate the book, and leaving immersive mode restores host spacing.
     for (const nav of ['is-floating-nav', 'auto-full-screen', '']) {
