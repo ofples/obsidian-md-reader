@@ -10,7 +10,7 @@ const SRC = fileURLToPath(new URL('../main.js', import.meta.url));
 const source = readFileSync(SRC, 'utf8') +
   '\nmodule.exports.__digestTest = { digestSelectionText, digestSafeVaultPath, readDigestState, writeDigestState,' +
   ' validateDigestResult, validateDigestNote, normalizeDigestField, digestRequestId, normalizeHighlightText, highlightIdentityId,' +
-  ' parseHighlightRecord, highlightRecordMarkdown, highlightCandidates, makeQuickEnvelope, validQuickCallback, readQuickCredentials,' +
+ ' parseHighlightRecord, highlightRecordMarkdown, highlightCandidates, relocatedHighlightCandidate, makeQuickEnvelope, validQuickCallback, readQuickCredentials,' +
   ' readQuickPending, writeQuickPending, resetQuickCredentials, readDigestAnnotationLinks, digestRangeContext, ReaderView, MdReaderPlugin, DIGEST_RESULT_ACTION };\n';
 const notices = [];
 class MockTFile {
@@ -138,6 +138,17 @@ assert.deepEqual(T.highlightCandidates('before A useful excerpt after / before A
 assert.deepEqual(T.highlightCandidates('before A useful excerpt maybe / before A useful excerpt perhaps',
   { quote: 'A useful excerpt', before: 'before', after: 'after' }), [], 'weakly similar repeated passages stay unresolved');
 
+const savedNearby = { quote: 'The exact retained sentence.', before: 'Old surrounding context that still ends in a stable phrase', after: 'Old following context that was corrected by recognition' };
+const retainedPrefix = 'Old surrounding context that still ends in a stable phrase';
+const editedNearby = `New heading ${retainedPrefix.slice(-24)} ${savedNearby.quote} New words after correction.`;
+assert.deepEqual(T.relocatedHighlightCandidate(editedNearby, savedNearby),
+  { start: editedNearby.indexOf(savedNearby.quote), end: editedNearby.indexOf(savedNearby.quote) + savedNearby.quote.length, contextMatches: false, relocated: true },
+  'a unique unchanged quote may relocate when one 24-character context anchor remains');
+assert.equal(T.relocatedHighlightCandidate('New preceding words. The exact retained sentence. New following words.', savedNearby), null,
+  'relocation requires at least one surviving stored context side');
+assert.equal(T.relocatedHighlightCandidate(`New ${retainedPrefix.slice(-24)} ${savedNearby.quote} X / other ${savedNearby.quote} Y`, savedNearby), null,
+  'repeated exact quotes remain ambiguous even when one occurrence has supporting context');
+
 const quickStorage = { getItem: (key) => memory.get(key) ?? null, setItem: (key, value) => memory.set(key, value), removeItem: (key) => memory.delete(key) };
 quickStorage.setItem('md-reader-quick-v1:' + encodeURIComponent(vault), JSON.stringify({ client: quickClient, secret: quickSecret, trusted: false }));
 const quick = await T.makeQuickEnvelope(vault, '{"text":"exact raw JSON"}', requestId, quickStorage);
@@ -248,13 +259,18 @@ globalThis.window = {
   open(uri) { this.opened.push(uri); return {}; },
 };
 const selectedFile = { path: 'Reading/book.md', stat: { mtime: 10 } };
-const range = { collapsed: false, startContainer: {}, endContainer: {}, cloneRange() { return this; } };
+const mockSelectionRoot = () => ({ contains: () => true, isConnected: true,
+  ownerDocument: { getSelection: () => ({ isCollapsed: true }) } });
+const mockSelectionRange = (text) => ({ collapsed: false, startContainer: {}, endContainer: {}, cloneRange() { return this; },
+  cloneContents() { return { nodeType: 11, childNodes: [{ nodeType: 3, nodeValue: text }] }; } });
+const range = mockSelectionRange('A useful excerpt');
 const selection = { file: selectedFile, text: 'A useful excerpt', heading: 'Chapter\n1', sourcePath: selectedFile.path, sourceMtime: 10, range, renderGen: 8 };
 const reader = Object.create(T.ReaderView.prototype);
 reader.file = selectedFile;
 reader._renderGen = 8;
-reader._digestSelection = selection;
-reader.content = { contains: () => true };
+reader._digestSelection = null; // Menu dismissal may clear the cache before its action runs.
+reader.content = mockSelectionRoot();
+reader.applyPersistentHighlights = async () => {};
 selection.contextRoot = reader.content;
 let digestAssociations = 0;
 reader.plugin = { persistHighlight: async () => ({ id: 'e'.repeat(64) }), associateDigestAnnotation: () => { digestAssociations++; return true; } };
@@ -293,7 +309,7 @@ assert.equal(T.writeDigestState(vault, storage, savedState), true);
 assert.equal(await reader.saveSelectedDigest(selection), request, 'saved request reopens Bridge with the same deterministic identity');
 assert.equal(window.opened.length, 4, 'saved request reopens Bridge without generating a new handoff identity');
 assert.equal(JSON.parse(new URL(window.opened[3]).searchParams.get('payload')).requestId, payload.requestId);
-assert.ok(notices.includes('Opening saved Digest in Bridge.'));
+assert.ok(notices.includes('Opening saved Digest.'));
 const associationsBeforeReceiptOpen = digestAssociations;
 const receiptStateBeforeOpen = storage.getItem(stateKey);
 reader.plugin.localDigestReceipt = (id) => id === 'e'.repeat(64) ? { request, id: 23 } : null;
@@ -307,8 +323,9 @@ assert.equal(storage.getItem(stateKey), receiptStateBeforeOpen, 'receipt reopen 
 
 const associationFailure = Object.create(T.ReaderView.prototype);
 const associationSelection = { ...selection, text: 'Excerpt without local association', sourceMtime: 10 };
+associationSelection.range = mockSelectionRange(associationSelection.text);
 associationFailure.file = selectedFile; associationFailure._renderGen = 8; associationFailure._digestSelection = associationSelection;
-associationFailure.content = { contains: () => true }; associationSelection.contextRoot = associationFailure.content;
+associationFailure.content = mockSelectionRoot(); associationSelection.contextRoot = associationFailure.content;
 const associationWriteFailureStorage = {
   getItem() { return null; },
   setItem(key) { if (key.startsWith('md-reader-digest-annotation-v1:')) throw new Error('simulated annotation association storage failure'); },
@@ -324,11 +341,75 @@ assert.equal(window.opened.length, openedBeforeAssociationFailure, 'failed local
 assert.ok(notices.some((message) => message.includes('could not link this excerpt')));
 window.localStorage = storage;
 
+// Native detail stays foregrounded after saving, so Reader may only have the
+// dispatch hash. A local dispatch route must never masquerade as a SAVED ID.
+const nativeFlow = Object.create(T.ReaderView.prototype);
+const nativePlugin = Object.create(T.MdReaderPlugin.prototype);
+nativeFlow.file = { path: 'Reading/native-flow.md', stat: { mtime: 20 } };
+nativeFlow._renderGen = 1;
+nativeFlow.content = mockSelectionRoot();
+nativeFlow.app = nativePlugin.app = reader.app;
+nativeFlow.plugin = nativePlugin;
+nativeFlow.digestNotice = (message) => notices.push(message);
+let standaloneSaved = false, paintedBeforeOpen = false;
+const flowAnnotation = '4'.repeat(64);
+nativePlugin.persistHighlight = async () => { standaloneSaved = true; return { id: flowAnnotation }; };
+nativeFlow.applyPersistentHighlights = async () => { paintedBeforeOpen = standaloneSaved; };
+const flowSelection = { file: nativeFlow.file, sourcePath: nativeFlow.file.path, sourceMtime: 20,
+  range: mockSelectionRange('Native detail without a foreground Reader callback'), text: 'Native detail without a foreground Reader callback', renderGen: 1, contextRoot: nativeFlow.content };
+nativeFlow._digestSelection = flowSelection;
+const originalOpen = window.open;
+const originalOpenCount = window.opened.length;
+window.open = function(uri) { assert.equal(paintedBeforeOpen, true, 'standalone highlight is visible before native handoff'); this.opened.push(uri); return {}; };
+const flowRequest = await nativeFlow.saveSelectedDigest(flowSelection, 'quick');
+assert.ok(flowRequest);
+assert.deepEqual(nativePlugin.localDigestReceipt(flowAnnotation), { request: flowRequest }, 'dispatched request has an idless native lookup route');
+assert.equal(T.readDigestAnnotationLinks(vault, storage).receipts[flowAnnotation], undefined, 'dispatch does not manufacture a SAVED receipt');
+assert.equal(await nativeFlow.saveSelectedDigest(flowSelection, 'quick'), flowRequest, 'repeat opens the authoritative native receipt route');
+assert.equal(window.opened.at(-1), 'supernote-bridge://digest-receipt?request=' + flowRequest);
+assert.equal(nativeFlow.openDigestReceipt({ request: flowRequest, id: -1 }), false, 'asserted native IDs remain strictly validated');
+assert.equal(nativePlugin.handleDigestResult({ vault, request: flowRequest, status: 'cancelled' }), true);
+assert.equal(nativePlugin.localDigestReceipt(flowAnnotation), null, 'cancelled dispatch removes its idless route');
+assert.equal(standaloneSaved, true, 'cancelling native capture keeps the standalone Reader highlight');
+const uncertainAnnotation = 'a1'.repeat(32);
+nativePlugin.persistHighlight = async () => ({ id: uncertainAnnotation });
+const uncertainSelection = { ...flowSelection, text: 'A capture with an ambiguous native result' };
+uncertainSelection.range = mockSelectionRange(uncertainSelection.text);
+nativeFlow._digestSelection = uncertainSelection;
+const uncertainRequest = await nativeFlow.saveSelectedDigest(uncertainSelection, 'quick');
+assert.equal(nativePlugin.handleDigestResult({ vault, request: uncertainRequest, status: 'uncertain' }), true);
+assert.equal(T.readDigestState(vault, storage).requests[uncertainRequest], 'uncertain');
+assert.deepEqual(nativePlugin.localDigestReceipt(uncertainAnnotation), { request: uncertainRequest }, 'uncertain capture retains only an authoritative native lookup');
+const createsBeforeUncertainOpen = window.opened.filter((uri) => uri.startsWith('supernote-bridge://digest?')).length;
+assert.equal(await nativeFlow.saveSelectedDigest(uncertainSelection, 'quick'), uncertainRequest);
+assert.equal(window.opened.at(-1), 'supernote-bridge://digest-receipt?request=' + uncertainRequest);
+assert.equal(window.opened.filter((uri) => uri.startsWith('supernote-bridge://digest?')).length, createsBeforeUncertainOpen, 'uncertain result can never resend the native write');
+assert.equal(T.readDigestAnnotationLinks(vault, storage).receipts[uncertainAnnotation], undefined, 'uncertain result never invents a SAVED ID');
+nativePlugin.persistHighlight = async () => { standaloneSaved = true; return { id: flowAnnotation }; };
+const priorReceiptRequest = '1'.repeat(64);
+const priorReceiptState = T.readDigestState(vault, storage); priorReceiptState.requests[priorReceiptRequest] = 'pending'; T.writeDigestState(vault, storage, priorReceiptState);
+nativePlugin.associateDigestAnnotation(vault, priorReceiptRequest, flowAnnotation);
+assert.equal(nativePlugin.handleDigestResult({ vault, request: priorReceiptRequest, status: 'saved', id: '99' }), true);
+const failSelection = { ...flowSelection, text: 'A separate capture whose Android dispatch throws' };
+failSelection.range = mockSelectionRange(failSelection.text);
+nativeFlow._digestSelection = failSelection;
+window.open = () => { throw new Error('synthetic dispatch failure'); };
+assert.equal(await nativeFlow.saveSelectedDigest(failSelection, 'quick'), null);
+assert.equal(standaloneSaved, true, 'failed Android dispatch keeps the standalone highlight');
+const failedPayload = { version: 1, requestId: '', text: failSelection.text, origin: { vault, file: nativeFlow.file.path } };
+const failedRequest = await T.digestRequestId(failedPayload);
+assert.equal(T.readDigestState(vault, storage).requests[failedRequest], undefined, 'failed dispatch does not leave a pending native capture');
+assert.equal(T.readDigestAnnotationLinks(vault, storage).pending[failedRequest], undefined, 'failed dispatch removes its new pending association');
+assert.equal(T.readDigestAnnotationLinks(vault, storage).requests[failedRequest], undefined, 'failed dispatch has no Open Digest route');
+assert.deepEqual(nativePlugin.localDigestReceipt(flowAnnotation), { request: priorReceiptRequest, id: 99 }, 'failed new dispatch preserves an older verified native receipt');
+window.open = originalOpen;
+window.opened.length = originalOpenCount;
+
 const stale = Object.create(T.ReaderView.prototype);
 stale.file = selectedFile;
 stale._renderGen = 9;
 stale._digestSelection = selection;
-stale.content = { contains: () => true };
+stale.content = mockSelectionRoot();
 selection.contextRoot = stale.content;
 stale.plugin = reader.plugin;
 stale.app = reader.app;
@@ -339,7 +420,7 @@ const staleMtime = Object.create(T.ReaderView.prototype);
 staleMtime.file = selectedFile;
 staleMtime._renderGen = 8;
 staleMtime._digestSelection = selection;
-staleMtime.content = { contains: () => true };
+staleMtime.content = mockSelectionRoot();
 selection.contextRoot = staleMtime.content;
 staleMtime.plugin = reader.plugin;
 staleMtime.app = { vault: { getName: () => vault, cachedRead: async () => { selectedFile.stat.mtime = 11; return '# changed source'; } } };
@@ -352,7 +433,7 @@ const staleRange = Object.create(T.ReaderView.prototype);
 staleRange.file = selectedFile;
 staleRange._renderGen = 8;
 staleRange._digestSelection = selection;
-staleRange.content = { contains: () => true };
+staleRange.content = mockSelectionRoot();
 selection.contextRoot = staleRange.content;
 staleRange.plugin = reader.plugin;
 staleRange._digestSelectionResolver = async () => { range.collapsed = true; return null; };
@@ -362,11 +443,30 @@ assert.equal(await staleRange.saveSelectedDigest(selection), null, 'collapsed ra
 assert.equal(window.opened.length, 5, 'collapsed selection is never sent');
 range.collapsed = false;
 
+for (const change of ['native-range', 'range-text', 'active-action']) {
+  const guarded = Object.create(T.ReaderView.prototype), root = mockSelectionRoot();
+  const savedRange = mockSelectionRange('An asynchronously validated capture');
+  const saved = { file: selectedFile, text: 'An asynchronously validated capture', sourcePath: selectedFile.path,
+    sourceMtime: 10, renderGen: 8, range: savedRange, contextRoot: root };
+  Object.assign(guarded, { file: selectedFile, content: root, _renderGen: 8, _digestSelection: null,
+    plugin: reader.plugin, app: reader.app, applyPersistentHighlights: async () => {}, digestNotice: message => notices.push(message) });
+  guarded._digestSelectionResolver = async () => {
+    await Promise.resolve();
+    if (change === 'native-range') root.ownerDocument.getSelection = () => ({ isCollapsed: false, rangeCount: 1, getRangeAt: () => mockSelectionRange('A different selection') });
+    if (change === 'range-text') savedRange.cloneContents = mockSelectionRange('Changed source bytes').cloneContents;
+    if (change === 'active-action') guarded._digestSelection = { ...saved, range: mockSelectionRange(saved.text) };
+    return null;
+  };
+  const countBeforeGuard = window.opened.length;
+  assert.equal(await guarded.saveSelectedDigest(saved, 'quick'), null, change + ' during provenance invalidates the pinned action');
+  assert.equal(window.opened.length, countBeforeGuard, change + ' cannot dispatch Bridge');
+}
+
 const managed = Object.create(T.ReaderView.prototype);
 managed.file = selectedFile;
 managed._renderGen = 8;
 managed._digestSelection = selection;
-managed.content = { contains: () => true };
+managed.content = mockSelectionRoot();
 selection.contextRoot = managed.content;
 managed.plugin = reader.plugin;
 managed.app = { vault: { getName: () => vault, cachedRead: async () => '---\nnomad_transcripts: true\n---\ntext' }, plugins: { plugins: {} } };
@@ -388,9 +488,10 @@ managedSuccess._digestSelectionResolver = async () => ({
   fileId: 'F-fixture',
 });
 managedSuccess.app = managed.app;
-managedSuccess.content = { contains: () => true };
+managedSuccess.content = mockSelectionRoot();
 selection.contextRoot = managedSuccess.content;
 managedSuccess.plugin = reader.plugin;
+managedSuccess.applyPersistentHighlights = async () => {};
 managedSuccess.digestNotice = (message) => notices.push(message);
 const managedRequest = await managedSuccess.saveSelectedDigest(selection);
 assert.ok(managedRequest, 'managed transcript with valid stable source provenance opens Bridge');
@@ -410,7 +511,7 @@ managedError._renderGen = 8;
 managedError._digestSelection = selection;
 managedError._digestSelectionResolver = async () => { throw new Error('page lookup failed'); };
 managedError.app = managed.app;
-managedError.content = { contains: () => true };
+managedError.content = mockSelectionRoot();
 selection.contextRoot = managedError.content;
 managedError.plugin = reader.plugin;
 managedError.digestNotice = (message) => notices.push(message);

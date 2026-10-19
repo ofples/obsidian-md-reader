@@ -18,6 +18,7 @@ const {
 } = require('obsidian');
 
 const VIEW_TYPE_READER = 'horizontal-reader-view';
+const READER_TAP_MOVE = 10, READER_TAP_MS = 300;
 
 const DEFAULT_SETTINGS = {
   fontSize: 1.0,          // multiplier of theme font -> --hr-font-size (em)
@@ -145,6 +146,32 @@ function highlightCandidates(text, record) {
   return supported.length === 1 ? supported : [];
 }
 
+function relocatedHighlightCandidate(text, record) {
+  const quote = normalizeHighlightText(record?.quote, DIGEST_TEXT_LIMIT);
+  if (!quote || !text) return null;
+  const before = normalizeHighlightText(record.before, 240);
+  const after = normalizeHighlightText(record.after, 240);
+  const positions = [];
+  let at = text.indexOf(quote);
+  while (at >= 0) {
+    positions.push(at);
+    if (positions.length > 1) return null;
+    at = text.indexOf(quote, at + 1);
+  }
+  if (positions.length !== 1) return null;
+  const start = positions[0], end = start + quote.length;
+  const left = normalizeHighlightText(text.slice(Math.max(0, start - before.length * 4 - 32), start),
+    Math.min(4096, before.length + 4), true);
+  const right = normalizeHighlightText(text.slice(end, end + after.length * 4 + 32), 4096);
+  const sideMatches = (stored, actual, edge) => {
+    if (!stored) return false;
+    const anchor = stored.length >= 24 ? (edge === 'before' ? stored.slice(-24) : stored.slice(0, 24)) : stored;
+    return edge === 'before' ? actual.endsWith(anchor) : actual.startsWith(anchor);
+  };
+  if (!sideMatches(before, left, 'before') && !sideMatches(after, right, 'after')) return null;
+  return { start, end, contextMatches: false, relocated: true };
+}
+
 function digestLocalStorage() { try { return window.localStorage; } catch (_) { return null; } }
 
 function quickStoreKey(vault) { return QUICK_STORE_PREFIX + encodeURIComponent(vault); }
@@ -154,8 +181,8 @@ function digestAnnotationKey(vault) { return DIGEST_ANNOTATION_PREFIX + encodeUR
 function readDigestAnnotationLinks(vault, storage) {
   try {
     const value = JSON.parse(storage?.getItem(digestAnnotationKey(vault)) || '{}');
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return { pending: {}, receipts: {} };
-    const pending = {}, receipts = {};
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return { pending: {}, receipts: {}, requests: {} };
+    const pending = {}, receipts = {}, requests = {};
     for (const [request, annotation] of Object.entries(value.pending || {})) {
       if (DIGEST_REQUEST_RE.test(request) && DIGEST_REQUEST_RE.test(annotation)) pending[request] = annotation;
     }
@@ -165,8 +192,11 @@ function readDigestAnnotationLinks(vault, storage) {
         receipts[annotation] = { request: receipt.request, id: receipt.id };
       }
     }
-    return { pending, receipts };
-  } catch (_) { return { pending: {}, receipts: {} }; }
+    for (const [request, annotation] of Object.entries(value.requests || {})) {
+      if (DIGEST_REQUEST_RE.test(request) && DIGEST_REQUEST_RE.test(annotation)) requests[request] = annotation;
+    }
+    return { pending, receipts, requests };
+  } catch (_) { return { pending: {}, receipts: {}, requests: {} }; }
 }
 
 function writeDigestAnnotationLinks(vault, storage, links) {
@@ -509,8 +539,8 @@ const STRINGS = {
     quoteFolderName: 'Quotes folder',
     quoteFolderDesc: 'One Markdown note per book. Path inside the vault; empty uses Books/Quotes.',
     nativeDigestSettings: 'Native Digests',
-    configureDigestDefaults: 'Configure defaults in Supernote Bridge',
-    digestDefaultsHint: 'Available on Android when Supernote Bridge is installed.',
+    configureDigestDefaults: 'Digest preferences',
+    digestDefaultsHint: 'Create a Digest from selected text, then use Edit in its native entry to add a note.',
     quoteTitle: 'Quotes',
     sPaddingDesc: 'Empty space at the top and bottom of the page',
     cmdTint: 'Cycle page tint',
@@ -1705,7 +1735,7 @@ class ReaderView extends ItemView {
     finally { window.clearTimeout(timer); }
   }
   focus() { this.viewport?.focus({preventScroll:true}); }
-  cancelPaperGesture() { this._snAbortDrag?.(); this._lastTouch = Date.now(); }
+  cancelPaperGesture() { this._snAbortDrag?.(true); this._lastTouch = Date.now(); }
   togglePageIndicator() {
     if (this.pageIndicator) this.pageIndicator.hidden = !this.pageIndicator.hidden;
   }
@@ -1782,28 +1812,6 @@ class ReaderView extends ItemView {
     const menuButton = tools.createEl('button', { cls: 'hr-reader-menu', text: t('menuButton'), attr: { 'aria-label': t('menuNav'), 'aria-haspopup': 'menu' } });
     this.statusText = tools.createDiv('hr-status-text');
     const appearanceButton = tools.createEl('button', { cls: 'hr-reader-appearance', text: 'Aa', attr: { 'aria-label': t('menuAppearance'), title: t('menuAppearance') } });
-    // Selection actions live outside the ordinary statusbar. Paper and other
-    // reader skins may intentionally hide that bar while retaining gestures.
-    this.selectionActions = vp.createDiv('hr-reader-selection-actions');
-    this.selectionActions.hidden = true;
-    this.selectionActions.setAttribute('role', 'toolbar');
-    this.selectionActions.setAttribute('aria-label', 'Selected text actions');
-    this.selectionActions.dataset.ignoreSwipe = 'true';
-    this.selectionActions.dataset.readerGestureIgnore = 'true';
-    this.registerDomEvent(this.selectionActions, 'mousedown', (event) => event.preventDefault());
-    const actionButton = (cls, text, label, handler) => {
-      const button = this.selectionActions.createEl('button', { cls, text, attr: { 'aria-label': label, title: label } });
-      button.hidden = true;
-      this.registerDomEvent(button, 'mousedown', (e) => { e.preventDefault(); this._actionSelection = this._digestSelection || this._selectedQuote || this.selectedQuote(); });
-      this.registerDomEvent(button, 'click', (e) => { e.stopPropagation(); this._selectionActionPromise = handler.call(this, this._actionSelection); this._actionSelection = null; });
-      return button;
-    };
-    if (digestIsAndroid()) {
-      this.digestButton = actionButton('hr-reader-digest', 'Digest', 'Digest', function (selection) { return this.saveSelectedDigest(selection, 'quick'); });
-      this.digestReviewButton = actionButton('hr-reader-digest-review', 'Digest with note…', 'Digest with note', function (selection) { return this.saveSelectedDigest(selection, 'review'); });
-    }
-    this.highlightButton = actionButton('hr-reader-highlight', 'Highlight', 'Highlight selection', function (selection) { return this.toggleSelectedHighlight(selection); });
-    this.copyButton = actionButton('hr-reader-copy', 'Copy', 'Copy selection', function (selection) { return this.copySelectedText(selection); });
     this.setupQuoteSelection();
     this.registerDomEvent(menuButton, 'click', (e) => {
       e.stopPropagation();
@@ -2724,6 +2732,11 @@ class ReaderView extends ItemView {
   openNavMenu(evt = {clientX:window.innerWidth,clientY:0}) {
     this.focus();
     const menu = new Menu();
+    if (this._readerActionMenu) this._readerActionMenu.hide?.();
+    this._readerActionMenu = menu;
+    this._selectionMenuOpen = true;
+    this._selectionSnapshotToken = (this._selectionSnapshotToken || 0) + 1;
+    this.hideSelectionActions();
     this._snReaderMenuOpen = true;
     let selected = false;
     let closing = false;
@@ -2746,6 +2759,11 @@ class ReaderView extends ItemView {
       // Let native menu focus restoration and workspace activation finish.
       window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
         this._snReaderMenuOpen = false;
+        if (this._readerActionMenu === menu) {
+          this._readerActionMenu = null;
+          this._selectionMenuOpen = false;
+          this.flushPersistentHighlightRefresh();
+        }
         // Native mobile menu dismissal may activate an old sidebar leaf.
         // Keep intentional note/action navigation; restore only lost focus.
         const active = this.app.workspace.activeLeaf;
@@ -2759,6 +2777,8 @@ class ReaderView extends ItemView {
     const panel = menu.dom;
     if (panel) {
       panel.addClass('sn-reader-menu');
+      panel.dataset.readerGestureIgnore = 'true';
+      panel.dataset.ignoreSwipe = 'true';
       // The native floating menu scrolls on mouse hover. In a fixed sheet this
       // moves another action under the pointer between pointing and tapping.
       panel.querySelector('.menu-scroll')?.addEventListener('mousemove',event=>event.stopImmediatePropagation(),true);
@@ -2768,12 +2788,6 @@ class ReaderView extends ItemView {
       const close = header.createEl('button',{cls:'sn-reader-menu-close',text:'×',attr:{'aria-label':'Close reader menu'}});
       close.addEventListener('click',event=>{event.stopPropagation();menu.hide();});
       panel.insertBefore(header,panel.firstChild);
-    }
-    const liveQuote = this.selectedQuote();
-    const quote = liveQuote || this._selectedQuote;
-    if (quote) {
-      if (liveQuote) { this._selectedQuote = liveQuote; this._digestSelection = liveQuote; }
-      this.addSelectionMenuItems(menu, quote, true);
     }
     menu.addItem((i) => i.setTitle(t('menuToc')).setIcon('list').onClick(() => this.openToc()));
     menu.addItem((i) => i.setTitle(t('menuSearch')).setIcon('search').onClick(() => this.openSearch()));
@@ -2849,29 +2863,231 @@ class ReaderView extends ItemView {
   }
 
   hideSelectionActions() {
-    if (this.selectionActions) this.selectionActions.hidden = true;
-    for (const button of [this.digestButton, this.digestReviewButton, this.highlightButton, this.copyButton]) if (button) button.hidden = true;
+    // Selection commands are shown in Obsidian's contextual menu at the
+    // selection. Keep this hook for callers that also hide their own menus.
+  }
+
+  setSelectionActions(quote) {
+    if (!quote) {
+      this._selectedQuote = null;
+      this._digestSelection = null;
+      this.hideSelectionActions();
+      return;
+    }
+    this._selectedQuote = quote;
+    this._digestSelection = quote;
+    if (!this.isSelectionGestureActive()) this.viewport.classList.remove('hr-hide-ui');
+    // There is no second, fixed action dock: selection actions belong to the
+    // contextual menu, opened after the selection gesture is complete.
+  }
+
+  selectionGestureTarget(target) {
+    return !!(target && this.content?.contains(target) && !target.closest?.(
+      'a, input, button, textarea, select, [contenteditable], .hr-ui, .hr-end, .hr-fn, .hr-fn-pop'
+    ));
+  }
+
+  isSelectionGestureActive() { return !!this._selectionGesture?.active; }
+
+  isTextSelectionActive() {
+    const selection = this.content?.ownerDocument?.getSelection();
+    if (selection && !selection.isCollapsed && this.content.contains(selection.anchorNode)) return true;
+    const gesture = this._selectionGesture;
+    return !!(gesture?.active && (gesture.pointerType === 'pen' || Date.now() - gesture.startedAt >= 400));
+  }
+
+  selectedTextTapSnapshot(event) {
+    if (!event.isTrusted || event.isPrimary === false || this._selectionMenuOpen ||
+        this.persistentHighlightsAtTarget(event.target).length) return null;
+    const point = event.touches?.[0] || event, quote = this.selectedQuote();
+    if (!quote || !Number.isFinite(point.clientX) || !Number.isFinite(point.clientY)) return null;
+    const viewport = this.viewport.getBoundingClientRect(), win = this.content.ownerDocument.defaultView;
+    const hit = Array.from(quote.range.getClientRects()).some((rect) =>
+      point.clientX >= Math.max(0, viewport.left, rect.left) && point.clientX < Math.min(win.innerWidth, viewport.right, rect.right) &&
+      point.clientY >= Math.max(0, viewport.top, rect.top) && point.clientY < Math.min(win.innerHeight, viewport.bottom, rect.bottom));
+    return hit ? { quote, x: point.clientX, y: point.clientY, identifier: point.identifier } : null;
+  }
+
+  selectionSnapshotIsCurrent(quote) {
+    if (!quote || quote.file !== this.file || quote.sourcePath !== this.file?.path || quote.sourceMtime !== this.file?.stat?.mtime ||
+        quote.renderGen !== this._renderGen || quote.contextRoot !== this.content || !this.content?.isConnected ||
+        !quote.range || quote.range.collapsed || !this.content.contains(quote.range.startContainer) ||
+        !this.content.contains(quote.range.endContainer) || digestSelectionText(quote.range) !== quote.text) return false;
+    const selection = this.content.ownerDocument.getSelection();
+    if (!selection || selection.isCollapsed) return true; // A normal tap may clear native selection.
+    if (!selection.rangeCount) return false;
+    const live = selection.getRangeAt(0), saved = quote.range;
+    return live.startContainer === saved.startContainer && live.startOffset === saved.startOffset &&
+      live.endContainer === saved.endContainer && live.endOffset === saved.endOffset;
+  }
+
+  trackSelectedTextTap(event, source) {
+    const gesture = this._selectionGesture, tap = gesture?.tap;
+    if (!tap || gesture.source !== source || (source === 'pointer' && event.pointerId !== gesture.pointerId)) return;
+    const point = event.touches?.[0] || event;
+    if ((event.touches && event.touches.length !== 1) || Math.hypot(point.clientX - tap.x, point.clientY - tap.y) >= READER_TAP_MOVE) {
+      gesture.tap = null;
+    }
+  }
+
+  beginSelectionGesture(event, source) {
+    if (event.isPrimary === false || event.touches?.length > 1) {
+      if (this._selectionGesture) this._selectionGesture.tap = null;
+      return;
+    }
+    if (!this.selectionGestureTarget(event.target) || (event.button != null && event.button !== 0)) return;
+    if (source === 'mouse') this._highlightMouseDown = this.persistentHighlightsAtTarget(event.target).length
+      ? { x: event.clientX, y: event.clientY, time: Date.now() } : null;
+    if (this._selectionGesture) {
+      // Compatibility mouse/touch events belong to the same contact. A fresh
+      // primary down can recover a cancelled stream that never delivered up.
+      if (!this._selectionGesture.cancelled || source !== this._selectionGesture.source) return;
+    }
+    this._pendingSelectionMenuPoint = null;
+    this._selectionGesture = { source, pointerId: event.pointerId, pointerType: event.pointerType, active: true, startedAt: Date.now(),
+      tap: this.selectedTextTapSnapshot(event) };
+    this._selectionSnapshotToken = (this._selectionSnapshotToken || 0) + 1;
+    this._selectedQuote = null;
+    this._digestSelection = null;
+    this.hideSelectionActions();
+  }
+
+  cancelSelectionGesture(source, event) {
+    const gesture = this._selectionGesture;
+    if (!gesture || !gesture.active) return;
+    if (source === 'pointer' && gesture.pointerId != null && event?.pointerId !== gesture.pointerId) return;
+    if (source && gesture.source !== source && !(source === 'touch' && gesture.source === 'pointer' &&
+        (gesture.pointerType === 'touch' || gesture.pointerType === 'pen'))) return;
+    gesture.tap = null;
+    if (source) {
+      // Android cancels the pointer stream when native text selection takes
+      // over. The pen may still be held and extending the range across words.
+      gesture.cancelled = true;
+    } else this._selectionGesture = null; // blur/unload really ends our contact
+    if (!source) this._pendingSelectionMenuPoint = null;
+    this._selectionSnapshotToken = (this._selectionSnapshotToken || 0) + 1;
+    // Keep a partially completed browser selection. Pointer cancellation can
+    // happen when a pen briefly leaves the text while the user crosses words.
+    if (!source) this.flushPersistentHighlightRefresh();
+  }
+
+  prepareSelectionMenu(menu) {
+    if (this._readerActionMenu && this._readerActionMenu !== menu) this._readerActionMenu.hide?.();
+    this._readerActionMenu = menu;
+    this._selectionMenuOpen = true;
+    this._selectionSnapshotToken = (this._selectionSnapshotToken || 0) + 1;
+    this.hideSelectionActions();
+    if (menu.dom) {
+      menu.dom.dataset.readerGestureIgnore = 'true';
+      menu.dom.dataset.ignoreSwipe = 'true';
+    }
+    menu.onHide(() => {
+      if (this._readerActionMenu === menu) {
+        this._readerActionMenu = null;
+        this._selectionMenuOpen = false;
+        setTimeout(() => this.flushPersistentHighlightRefresh(), 0);
+      }
+    });
+  }
+
+  finishSelectionGesture(event, source) {
+    const gesture = this._selectionGesture;
+    if (!gesture || !gesture.active) return;
+    if (source === 'pointer' && gesture.source === 'pointer' && gesture.pointerId != null && event.pointerId !== gesture.pointerId) return;
+    if (event.touches?.length) return;
+    if (source !== gesture.source) {
+      // A native selection takeover may suppress pointerup but still deliver
+      // the contact's touchend or compatibility mouseup on actual release.
+      if (gesture.source !== 'pointer' || !gesture.cancelled ||
+          (source === 'touch' && gesture.pointerType !== 'touch' && gesture.pointerType !== 'pen') ||
+          (source !== 'touch' && source !== 'mouse')) return;
+    }
+    gesture.active = false;
+    this._selectionGesture = null;
+    const point = event.changedTouches?.[0] || event;
+    const tap = gesture.tap;
+    if (tap && event.isTrusted && source === gesture.source && !gesture.cancelled &&
+        (event.button == null || event.button === 0) && (tap.identifier == null || tap.identifier === point.identifier) &&
+        Date.now() - gesture.startedAt < READER_TAP_MS && Math.hypot(point.clientX - tap.x, point.clientY - tap.y) < READER_TAP_MOVE &&
+        this.selectionGestureTarget(event.target) && this.selectionSnapshotIsCurrent(tap.quote)) {
+      this._pendingSelectionMenuPoint = null;
+      this.cancelPaperGesture();
+      this._selectionSnapshotToken = (this._selectionSnapshotToken || 0) + 1;
+      this.showSelectionMenu(tap.quote, point);
+      return;
+    }
+    if (this._pendingSelectionMenuPoint) {
+      this._pendingSelectionMenuPoint = { x: Number(point?.clientX) || 0, y: Number(point?.clientY) || 0 };
+    }
+    this.scheduleSelectionSnapshot();
+  }
+
+  scheduleSelectionSnapshot() {
+    if (this._selectionGesture?.active || this._selectionMenuOpen) return;
+    const token = this._selectionSnapshotToken = (this._selectionSnapshotToken || 0) + 1;
+    const doc = this.content?.ownerDocument;
+    const view = doc?.defaultView;
+    const raf = (callback) => view?.requestAnimationFrame
+      ? view.requestAnimationFrame(callback) : setTimeout(callback, 0);
+    raf(() => setTimeout(() => {
+      if (token !== this._selectionSnapshotToken || this._selectionGesture?.active || this._selectionMenuOpen) return;
+      const quote = this.selectedQuote();
+      this.setSelectionActions(quote);
+      const point = this._pendingSelectionMenuPoint;
+      this._pendingSelectionMenuPoint = null;
+      if (quote && point && !this._selectionMenuOpen) this.showSelectionMenu(quote, point);
+      this.flushPersistentHighlightRefresh();
+    }, 0));
   }
 
   setupQuoteSelection() {
     const doc = this.content.ownerDocument;
     this.registerDomEvent(doc, 'selectionchange', () => {
+      // Keep upstream's native Selection -> cached quote flow. A menu/action
+      // owns its captured quote, while fresh browser selections remain native.
+      if (this._selectionMenuOpen || this._digestPreparing || this._highlightPreparing) return;
       const quote = this.selectedQuote();
       const selection = doc.getSelection();
-      if (quote) {
-        this._selectedQuote = quote;
-        this._digestSelection = quote;
-        this.viewport.classList.remove('hr-hide-ui');
-      } else {
-        this._selectedQuote = null;
-        this._digestSelection = null;
+      if (quote) this.setSelectionActions(quote);
+      else if (selection && (!selection.isCollapsed || this.content.contains(selection.anchorNode))) {
+        this.setSelectionActions(null);
       }
-      if (quote) {
-        if (this.selectionActions) this.selectionActions.hidden = false;
-        for (const button of [this.digestButton, this.digestReviewButton, this.highlightButton, this.copyButton]) if (button) button.hidden = false;
-      } else this.hideSelectionActions();
+      if (quote && this.isSelectionGestureActive()) this.cancelPaperGesture();
+      if (!this.isSelectionGestureActive()) this.flushPersistentHighlightRefresh();
     });
+    this.registerDomEvent(this.content, 'pointerdown', (event) => this.beginSelectionGesture(event, 'pointer'));
+    this.registerDomEvent(doc, 'pointermove', (event) => this.trackSelectedTextTap(event, 'pointer'), true);
+    this.registerDomEvent(doc, 'pointerup', (event) => this.finishSelectionGesture(event, 'pointer'), true);
+    this.registerDomEvent(doc, 'pointercancel', (event) => this.cancelSelectionGesture('pointer', event), true);
+    this.registerDomEvent(this.content, 'mousedown', (event) => this.beginSelectionGesture(event, 'mouse'));
+    this.registerDomEvent(doc, 'mousemove', (event) => this.trackSelectedTextTap(event, 'mouse'), true);
+    this.registerDomEvent(doc, 'mouseup', (event) => this.finishSelectionGesture(event, 'mouse'), true);
+    this.registerDomEvent(this.content, 'touchstart', (event) => this.beginSelectionGesture(event, 'touch'), { passive: true });
+    this.registerDomEvent(doc, 'touchmove', (event) => this.trackSelectedTextTap(event, 'touch'), { capture: true, passive: true });
+    this.registerDomEvent(doc, 'touchend', (event) => this.finishSelectionGesture(event, 'touch'), true);
+    this.registerDomEvent(doc, 'touchcancel', (event) => this.cancelSelectionGesture('touch', event), true);
+    this.registerDomEvent(doc.defaultView, 'blur', () => this.cancelSelectionGesture(), true);
+    this.registerDomEvent(doc, 'visibilitychange', () => {
+      if (!doc.hidden) void this.applyPersistentHighlights(this._renderGen);
+    });
+    this.registerDomEvent(doc.defaultView, 'focus', () => { void this.applyPersistentHighlights(this._renderGen); });
     this.registerDomEvent(this.content, 'contextmenu', (event) => {
+      if (this._selectionGesture?.cancelled && event.isTrusted && event.pointerType === 'mouse') {
+        // Nomad's native selection owns the cancelled touch stream and sends
+        // a later mouse-style contextmenu without any pointerup/touchend.
+        // Honor that actual platform menu request, using the current Range.
+        this._selectionGesture = null;
+        this._pendingSelectionMenuPoint = null;
+        this._selectionSnapshotToken = (this._selectionSnapshotToken || 0) + 1;
+      }
+      if (this._selectionGesture?.active) {
+        // Android's native text-selection takeover uses contextmenu before
+        // cancelling its pointer stream. Its default must remain available
+        // while the contact is held; only our Reader menu waits for release.
+        this._pendingSelectionMenuPoint = { x: event.clientX, y: event.clientY };
+        event.stopPropagation(); return;
+      }
+      if (this._selectionMenuOpen) { event.preventDefault(); event.stopPropagation(); return; }
       const persistent = this.persistentHighlightsAtTarget(event.target);
       if (persistent.length) {
         event.preventDefault(); event.stopPropagation();
@@ -2880,12 +3096,8 @@ class ReaderView extends ItemView {
       }
       const quote = this.selectedQuote();
       if (!quote) return;
-      this._selectedQuote = quote;
-      this._digestSelection = quote;
       event.preventDefault(); event.stopPropagation();
-      const menu = new Menu();
-      this.addSelectionMenuItems(menu, quote, true);
-      menu.showAtPosition({ x: event.clientX, y: event.clientY });
+      this.showSelectionMenu(quote, { x: event.clientX, y: event.clientY });
     });
     this.registerDomEvent(this.content, 'click', (event) => {
       const persistent = this.persistentHighlightsAtTarget(event.target);
@@ -2897,11 +3109,6 @@ class ReaderView extends ItemView {
           Math.hypot(event.clientX - down.x, event.clientY - down.y) > 10)) return;
       event.preventDefault(); event.stopPropagation();
       this.showPersistentHighlightMenu(persistent, event);
-    });
-    this.registerDomEvent(this.content, 'mousedown', (event) => {
-      if (this.persistentHighlightsAtTarget(event.target).length) {
-        this._highlightMouseDown = { x: event.clientX, y: event.clientY, time: Date.now() };
-      } else this._highlightMouseDown = null;
     });
     this.registerDomEvent(this.content, 'mouseup', () => {
       if (this._highlightMouseDown && Date.now() - this._highlightMouseDown.time > 600) this._highlightMouseDown = null;
@@ -2917,17 +3124,48 @@ class ReaderView extends ItemView {
 
   addSelectionMenuItems(menu, quote, includeQuote) {
     if (digestIsAndroid()) {
-      menu.addItem((i) => i.setTitle('Digest').setIcon('bookmark-plus').onClick(() => this.saveSelectedDigest(quote, 'quick')));
-      menu.addItem((i) => i.setTitle('Digest with note…').setIcon('file-text').onClick(() => this.saveSelectedDigest(quote, 'review')));
+      menu.addItem((i) => i.setTitle('Create Digest').setIcon('bookmark-plus').onClick(() => this.saveSelectedDigest(quote, 'quick')));
     }
     menu.addItem((i) => i.setTitle('Highlight').setIcon('highlighter').onClick(() => this.toggleSelectedHighlight(quote)));
     menu.addItem((i) => i.setTitle('Copy').setIcon('copy').onClick(() => this.copySelectedText(quote)));
     if (includeQuote) menu.addItem((i) => i.setTitle('Save quote to Obsidian').setIcon('quote').onClick(() => this.saveSelectedQuote(quote)));
   }
 
+  selectionMenuPosition(quote) {
+    const doc = this.content.ownerDocument, win = doc.defaultView;
+    const viewport = this.viewport.getBoundingClientRect();
+    const left = Math.max(0, viewport.left), top = Math.max(0, viewport.top);
+    const right = Math.max(left, Math.min(win.innerWidth, viewport.right));
+    const bottom = Math.max(top, Math.min(win.innerHeight, viewport.bottom));
+    const marginX = Math.min(12, (right - left) / 2), marginY = Math.min(12, (bottom - top) / 2);
+    const clampX = (x) => Math.max(left + marginX, Math.min(x, right - marginX));
+    const clampY = (y) => Math.max(top + marginY, Math.min(y, bottom - marginY));
+    let rects = [];
+    try { rects = Array.from(quote.range?.getClientRects?.() || []); } catch (_) { /* detached Range */ }
+    // A paginated Range can include offscreen columns. Anchor beside the last
+    // visible selected fragment; Android's synthetic menu coordinates may be 0,0.
+    const visible = rects.map((rect) => ({ left: Math.max(left, rect.left), right: Math.min(right, rect.right),
+      top: Math.max(top, rect.top), bottom: Math.min(bottom, rect.bottom) }))
+      .filter((rect) => rect.right > rect.left && rect.bottom > rect.top);
+    const anchor = visible[visible.length - 1];
+    return anchor ? { x: clampX(anchor.left), y: clampY(anchor.bottom + 8) }
+      : { x: (left + right) / 2, y: (top + bottom) / 2 };
+  }
+
+  showSelectionMenu(quote, _point) {
+    if (!quote || this._selectionMenuOpen) return false;
+    this._selectedQuote = quote;
+    this._digestSelection = quote;
+    const menu = new Menu();
+    this.prepareSelectionMenu(menu);
+    this.addSelectionMenuItems(menu, quote, true);
+    menu.showAtPosition(this.selectionMenuPosition(quote));
+    return true;
+  }
+
   async copySelectedText(snapshot) {
     const quote = snapshot || this.selectedQuote() || this._selectedQuote;
-    if (!quote || quote.file !== this.file) { new Notice(t('quoteSelect')); return false; }
+    if (!this.selectionSnapshotIsCurrent(quote)) { new Notice(t('quoteSelect')); return false; }
     try {
       await this.content.ownerDocument.defaultView.navigator.clipboard.writeText(quote.text);
       new Notice('Selection copied.');
@@ -2941,12 +3179,12 @@ class ReaderView extends ItemView {
 
   async toggleSelectedHighlight(snapshot) {
     const quote = snapshot || this.selectedQuote() || this._selectedQuote;
-    const isCurrent = () => !!quote && quote.file === this.file && quote.renderGen === this._renderGen &&
-      quote.sourceMtime === this.file?.stat?.mtime && quote.contextRoot === this.content && quote.range && !quote.range.collapsed &&
-      this.content.contains(quote.range.startContainer) && this.content.contains(quote.range.endContainer);
+    const isCurrent = () => this.selectionSnapshotIsCurrent(quote);
     if (!isCurrent()) {
       new Notice('Select text in the current Reader chapter first.'); return null;
     }
+    if (this._highlightPreparing) return null;
+    this._highlightPreparing = true;
     try {
       const record = await this.plugin.persistHighlight(quote, null, isCurrent);
       if (!record) throw new Error('The annotation file could not be created safely.');
@@ -2957,25 +3195,54 @@ class ReaderView extends ItemView {
         await this.plugin.removeHighlightRecord(record.id);
         new Notice('Highlight removed.');
       }
-      if (isCurrent()) await this.applyPersistentHighlights(this._renderGen);
+      if (isCurrent()) await this.applyPersistentHighlights(this._renderGen, { allowPreparing: true });
       return record;
     } catch (error) {
       console.warn('MD Reader: highlight could not be saved', error);
       new Notice('Could not save the highlight. Check the Reader Highlights folder and retry.');
       return null;
+    } finally {
+      this._highlightPreparing = false;
+      this.flushPersistentHighlightRefresh();
     }
   }
 
-  async applyPersistentHighlights(gen = this._renderGen) {
+  flushPersistentHighlightRefresh() {
+    if (this.isSelectionGestureActive() || this._selectionMenuOpen || this._digestPreparing || this._highlightPreparing) return;
+    if (this._pendingRepagination) {
+      this._pendingRepagination = false;
+      this._debouncedRemeasure?.();
+    }
+    if (this._pendingPersistentRefresh == null) return;
+    const gen = this._pendingPersistentRefresh;
+    this._pendingPersistentRefresh = null;
+    void this.applyPersistentHighlights(gen);
+  }
+
+  async applyPersistentHighlights(gen = this._renderGen, options = {}) {
     if (!this.file || !this.content || gen !== this._renderGen) return;
-    if (this._digestPreparing) return;
+    if (this.isSelectionGestureActive() || ((this._selectionMenuOpen || this._digestPreparing || this._highlightPreparing) && !options.allowPreparing)) {
+      this._pendingPersistentRefresh = gen;
+      return;
+    }
     const token = this._persistentApplyToken = (this._persistentApplyToken || 0) + 1;
     const sourcePath = this.file.path;
     let records;
     try { records = await this.plugin.highlightsForSource(this.file.path); }
     catch (error) { console.warn('MD Reader: saved highlights could not be read', error); return; }
     if (token !== this._persistentApplyToken || gen !== this._renderGen || this.file?.path !== sourcePath || !this.content) return;
+    // An asynchronous vault read may finish in the middle of a new selection.
+    // Replacing inline marks would invalidate its live Range and text handles.
+    if (this.isSelectionGestureActive() || ((this._selectionMenuOpen || this._digestPreparing || this._highlightPreparing) && !options.allowPreparing)) {
+      this._pendingPersistentRefresh = gen;
+      return;
+    }
+    this._pendingPersistentRefresh = null;
     this.clearPersistentHighlights();
+    if (!Array.isArray(records) || records.length === 0) {
+      this._persistentHighlightRecords = [];
+      return;
+    }
     const index = readerTextIndex(this.content);
     if (!index?.text) return;
     const css = this.content.ownerDocument.defaultView?.CSS;
@@ -2983,11 +3250,16 @@ class ReaderView extends ItemView {
     const intervals = new Map();
     const recordsForChapter = [];
     for (const record of records) {
+      if (!record || record.source !== sourcePath) continue;
       const fullDocumentQuote = this.chapters?.length === 1 && normalizeHighlightText(index.text, Math.max(1, index.text.length)) ===
         normalizeHighlightText(record.quote, DIGEST_TEXT_LIMIT);
-      const candidate = fullDocumentQuote
+      let candidate = fullDocumentQuote
         ? [{ start: 0, end: index.text.length, contextMatches: true }]
         : highlightCandidates(index.text, record);
+      if (!candidate.length && !fullDocumentQuote && this.chapters?.length === 1) {
+        const relocated = relocatedHighlightCandidate(index.text, record);
+        if (relocated) candidate = [relocated];
+      }
       if (candidate.length !== 1) continue;
       let found = false;
       for (let si = 0; si < index.segments.length; si++) {
@@ -3093,6 +3365,7 @@ class ReaderView extends ItemView {
       current.record.id === entry.record.id && current.start === entry.start && current.end === entry.end));
     if (!valid.length) return false;
     const menu = new Menu();
+    this.prepareSelectionMenu(menu);
     const counts = new Map();
     const labels = valid.map(({ record }) => {
       const excerpt = record.quote.length > 44 ? record.quote.slice(0, 44) + '…' : record.quote;
@@ -3113,13 +3386,11 @@ class ReaderView extends ItemView {
         .onClick(() => this.removePersistentHighlight(record)));
       const receipt = this.plugin.localDigestReceipt?.(record.id);
       if (!receipt && digestIsAndroid()) {
-        menu.addItem((item) => item.setTitle('Digest' + (valid.length > 1 ? ' · ' + label : '')).setIcon('bookmark-plus')
+        menu.addItem((item) => item.setTitle('Create Digest' + (valid.length > 1 ? ' · ' + label : '')).setIcon('bookmark-plus')
           .onClick(() => this.digestPersistentHighlight(entry, 'quick')));
-        menu.addItem((item) => item.setTitle('Digest with note…' + (valid.length > 1 ? ' · ' + label : '')).setIcon('file-text')
-          .onClick(() => this.digestPersistentHighlight(entry, 'review')));
       }
       if (receipt && digestIsAndroid()) {
-        menu.addItem((item) => item.setTitle('Open Digest in Bridge').setIcon('external-link')
+        menu.addItem((item) => item.setTitle('Open Digest').setIcon('external-link')
           .onClick(() => this.openDigestReceipt(receipt)));
       }
     }
@@ -3140,15 +3411,16 @@ class ReaderView extends ItemView {
   }
 
   openDigestReceipt(receipt) {
-    if (!receipt || !DIGEST_REQUEST_RE.test(receipt.request) || !Number.isSafeInteger(receipt.id) || receipt.id < 1 || !digestIsAndroid()) return false;
+    if (!receipt || !DIGEST_REQUEST_RE.test(receipt.request) ||
+        (receipt.id != null && (!Number.isSafeInteger(receipt.id) || receipt.id < 1)) || !digestIsAndroid()) return false;
     try {
-      const uri = 'supernote-bridge://digest-receipt?request=' + receipt.request + '&id=' + receipt.id;
+      const uri = 'supernote-bridge://digest-receipt?request=' + receipt.request + (receipt.id == null ? '' : '&id=' + receipt.id);
       window.open(uri, '_blank');
-      new Notice('Opening Digest #' + receipt.id + ' on this device in Bridge. Use its native Edit control to edit the entry.');
+      new Notice('Opening native Digest. Use Edit in the entry to add or change its note.');
       return true;
     } catch (error) {
       console.warn('MD Reader: Digest receipt could not be opened', error);
-      new Notice('Could not open this local Digest receipt. Open Supernote Bridge on this device.');
+      new Notice('Could not open this Digest on this device.');
       return false;
     }
   }
@@ -3203,6 +3475,12 @@ class ReaderView extends ItemView {
     if (!digestIsAndroid()) return null;
     mode = mode === 'quick' ? 'quick' : 'review';
     if (this._digestPreparing) return null;
+    if (snapshot) {
+      if (!this.selectionSnapshotIsCurrent(snapshot)) { this.digestNotice('Select text in the current Reader chapter first.'); return null; }
+      // Menu dismissal may clear the transient selection cache. The action
+      // owns its validated snapshot even if native selection is now collapsed.
+      this._digestSelection = snapshot;
+    }
     const sourceFile = this.file;
     const sourcePath = sourceFile?.path;
     const content = this.content;
@@ -3224,7 +3502,7 @@ class ReaderView extends ItemView {
       if (this.digestReviewButton) this.digestReviewButton.disabled = false;
       if (this.file === sourceFile && this.file?.path === sourcePath && this.content === content &&
           this._renderGen === renderGen && this.content?.isConnected) {
-        try { await this.applyPersistentHighlights(renderGen); }
+        try { await this.applyPersistentHighlights(renderGen, { allowPreparing: true }); }
         catch (error) { console.warn('MD Reader: saved highlights could not be refreshed after Digest preparation', error); }
       }
     }
@@ -3237,7 +3515,7 @@ class ReaderView extends ItemView {
       const sameActiveRange = !!active?.range && !!selected?.range && active.text === selected.text &&
         active.range.startContainer === selected.range.startContainer && active.range.startOffset === selected.range.startOffset &&
         active.range.endContainer === selected.range.endContainer && active.range.endOffset === selected.range.endOffset;
-      return !!selected && sameActiveRange && selected.file === this.file &&
+      return !!selected && sameActiveRange && this.selectionSnapshotIsCurrent(selected) && selected.file === this.file &&
       selected.sourcePath === this.file?.path && selected.sourceMtime === this.file?.stat?.mtime &&
       selected.renderGen === this._renderGen && selected.range && !selected.range.collapsed &&
       selected.contextRoot === this.content &&
@@ -3299,6 +3577,19 @@ class ReaderView extends ItemView {
     const annotation = await this.plugin.persistHighlight(selected, note, isCurrent);
     if (!annotation) { this.digestNotice('Could not safely save this excerpt in Reader Highlights. Check its folder and select the text again.'); return null; }
     if (!isCurrent()) { this.digestNotice('The Reader source changed while saving the highlight. Select the text again.'); return null; }
+    const paintBeforeHandoff = async () => {
+      const active = this._digestSelection;
+      await this.applyPersistentHighlights(selected.renderGen, { allowPreparing: true });
+      const win = this.content?.ownerDocument?.defaultView;
+      if (win?.requestAnimationFrame && !this.content.ownerDocument.hidden) {
+        await new Promise((resolve) => win.requestAnimationFrame(() => win.requestAnimationFrame(resolve)));
+      }
+      // Painting inline marks changes Range containers, so validate the source
+      // and the action identity after painting rather than reusing that Range.
+      return this._digestSelection === active && !this.isSelectionGestureActive() && this.file === selected.file &&
+        this.file?.path === selected.sourcePath && this.file?.stat?.mtime === selected.sourceMtime &&
+        this._renderGen === selected.renderGen && this.content === selected.contextRoot;
+    };
     const payload = { version: 1, requestId: '', text: selected.text, origin };
     if (note) payload.note = note;
     let json;
@@ -3315,11 +3606,12 @@ class ReaderView extends ItemView {
     try { storage = window.localStorage; } catch (_) { storage = null; }
     const state = readDigestState(vault, storage);
     const existingStatus = state.requests[payload.requestId];
-    if (existingStatus === 'saved') {
+    if (existingStatus === 'saved' || existingStatus === 'pending' || existingStatus === 'uncertain') {
       let receipt = null;
       try { receipt = this.plugin.localDigestReceipt?.(annotation.id) || null; }
       catch (error) { console.warn('MD Reader: local Digest receipt could not be read', error); }
       if (receipt?.request === payload.requestId) {
+        if (!await paintBeforeHandoff()) return null;
         return this.openDigestReceipt(receipt) ? payload.requestId : null;
       }
     }
@@ -3331,21 +3623,21 @@ class ReaderView extends ItemView {
         query = quickEnvelope.query;
       } catch (error) {
         console.warn('MD Reader: quick Digest signing failed', error);
-        this.digestNotice('Quick Digest setup failed. Use “Digest with note…” or check secure local storage.'); return null;
+        this.digestNotice('Digest permission setup failed. Check secure local storage and try again.'); return null;
       }
       if (!isCurrent()) { this.digestNotice('The Reader source changed before Digest handoff. Select the text again.'); return null; }
     }
     const uri = 'supernote-bridge://digest?' + query + '&payload=' + encodeURIComponent(json);
     if (uri.length > DIGEST_URI_LIMIT) { this.digestNotice('This Digest request is too large to open. Select a shorter passage.'); return null; }
     if (existingStatus === 'saved') {
+      if (!await paintBeforeHandoff()) return null;
       try {
-        this.digestNotice('Opening saved Digest in Bridge.');
+        this.digestNotice('Opening saved Digest.');
         window.open(uri, '_blank');
-        void this.applyPersistentHighlights(this._renderGen);
         return payload.requestId;
       } catch (error) {
         console.warn('MD Reader: saved Digest could not be reopened in Supernote Bridge', error);
-        this.digestNotice('Could not reopen this saved Digest in Supernote Bridge. Open Bridge and check the Digest list.');
+        this.digestNotice('Could not reopen this saved Digest. Check the native Digest list.');
         return null;
       }
     }
@@ -3366,18 +3658,41 @@ class ReaderView extends ItemView {
       quickPending[payload.requestId] = quickEnvelope.credentials.client;
       if (!writeQuickPending(vault, storage, quickPending)) {
         delete state.requests[payload.requestId]; writeDigestState(vault, storage, state);
-        this.digestNotice('Reader could not save local Quick Digest state. Use “Digest with note…” instead.'); return null;
+        this.digestNotice('Reader could not save local Digest permission state. Check local storage and try again.'); return null;
       }
+    }
+    if (!isCurrent()) { this.digestNotice('The Reader source changed before Digest handoff. Select the text again.'); return null; }
+    if (!await paintBeforeHandoff()) return null;
+    // Keep a request-only route available when native detail remains in front
+    // and Obsidian never receives a foreground SAVED callback. Bridge checks
+    // its own SAVED ledger before opening; this record is not proof of a save.
+    const dispatchLinks = readDigestAnnotationLinks(vault, storage);
+    const previousDispatch = dispatchLinks.requests[payload.requestId];
+    dispatchLinks.requests[payload.requestId] = annotation.id;
+    if (!writeDigestAnnotationLinks(vault, storage, dispatchLinks)) {
+      this.digestNotice('Could not save the local Digest link. Check local storage and try again.'); return null;
     }
     try {
       window.open(uri, '_blank');
       const dispatchNotice = mode === 'quick'
-        ? (quickEnvelope?.credentials.trusted ? 'Saving Digest in Bridge…' : 'Confirm one-time Quick Digest access in Bridge.')
+        ? 'Opening native Digest. Use Edit in the entry to add a note.'
         : 'Review and save in Supernote Bridge. Reader will report success only after Bridge confirms it.';
-      this.digestNotice(dispatchNotice + ' If Bridge does not open, install or update it and retry.');
-      void this.applyPersistentHighlights(this._renderGen);
+      this.digestNotice(dispatchNotice);
       return payload.requestId;
     } catch (error) {
+      const failedLinks = readDigestAnnotationLinks(vault, storage);
+      if (previousDispatch) failedLinks.requests[payload.requestId] = previousDispatch;
+      else delete failedLinks.requests[payload.requestId];
+      if (existingStatus == null) delete failedLinks.pending[payload.requestId];
+      writeDigestAnnotationLinks(vault, storage, failedLinks);
+      if (existingStatus == null) {
+        const failedState = readDigestState(vault, storage);
+        delete failedState.requests[payload.requestId];
+        writeDigestState(vault, storage, failedState);
+        const failedQuick = readQuickPending(vault, storage);
+        delete failedQuick[payload.requestId];
+        writeQuickPending(vault, storage, failedQuick);
+      }
       console.warn('MD Reader: Supernote Bridge could not be opened', error);
       this.digestNotice('Could not dispatch the Digest link. Install or update Supernote Bridge, then retry this selection.');
       return null;
@@ -3891,6 +4206,10 @@ class ReaderView extends ItemView {
       this._repaginateTimer = setTimeout(() => {
         this._repaginateTimer = null;
         if (!this.content || !this.content.isConnected) return;
+        if (this.isSelectionGestureActive() || this._selectionMenuOpen || this._digestPreparing || this._highlightPreparing) {
+          this._pendingRepagination = true;
+          return;
+        }
         this.retainLayoutAnchor();
         // поля зависят от размера шрифта и высоты строки статуса — пересчитать
         // перед замером (срабатывает и на смену темы: css-change ведёт сюда)
@@ -4017,23 +4336,29 @@ class ReaderView extends ItemView {
     const vp = this.viewport;
     // OS_EDGE only leaves the OS back-gesture sliver alone; Obsidian's drawer zone
     // is handled by data-ignore-swipe + capture-phase stopPropagation.
-    const OS_EDGE = 12, SWIPE = 45, CLAIM = 6, TAP_MOVE = 10, TAP_MS = 300;
+    const OS_EDGE = 12, SWIPE = 45, CLAIM = 6, TAP_MOVE = READER_TAP_MOVE, TAP_MS = READER_TAP_MS;
     let x0 = 0, y0 = 0, t0 = 0, dragging = false, decided = false, horizontal = false;
     let bottomStart = false, menuSwipe = false;
     let highlightTap = null;
     let pinch = null; // {d0, base} — щипок меняет размер шрифта, а не масштаб окна
 
-    const abortDrag = () => {
+    const nativeSelection = () => {
+      const selection = vp.ownerDocument.getSelection();
+      return !!(selection && !selection.isCollapsed && this.content.contains(selection.anchorNode));
+    };
+    const abortDrag = (preserveSelection = false) => {
       if (dragging) {
         dragging = false; decided = false; horizontal = false; bottomStart = false; menuSwipe = false;
         highlightTap = null;
-        this.content.style.transition = this.plugin.settings.animate ? 'transform 0.2s ease' : 'none';
-        this.applyTransform();
+        if (!preserveSelection && !nativeSelection() && !this._selectionGesture?.cancelled) {
+          this.content.style.transition = this.plugin.settings.animate ? 'transform 0.2s ease' : 'none';
+          this.applyTransform();
+        }
       }
     };
 
     const interactive = (tg) => !!(tg && tg.closest && tg.closest(
-      'a, input, button, textarea, select, [contenteditable], [data-reader-gesture-ignore], .task-list-item-checkbox, .callout-fold, .footnote-link, audio, video, .hr-ui, .hr-reader-selection-actions, .hr-end, .hr-fn, .hr-fn-pop'
+      'a, input, button, textarea, select, [contenteditable], [data-reader-gesture-ignore], .task-list-item-checkbox, .callout-fold, .footnote-link, audio, video, .hr-ui, .hr-end, .hr-fn, .hr-fn-pop'
     ));
 
     this._snAbortDrag = abortDrag;
@@ -4052,7 +4377,7 @@ class ReaderView extends ItemView {
       if (e.target && e.target.closest && e.target.closest('.hr-scrub')) { abortDrag(); return; }
       // в окне сноски палец прокручивает саму сноску, а не листает книгу
       if (e.target && e.target.closest && e.target.closest('.hr-fn-pop')) { abortDrag(); return; }
-      // The selection dock, including its padded gutters, is a control surface.
+      // Context menus and companion controls own their gestures.
       if (interactive(e.target) && !markedHighlights.length) { abortDrag(); return; }
       const tc = e.touches[0];
       const win = (vp.ownerDocument && vp.ownerDocument.defaultView) || window;
@@ -4101,14 +4426,14 @@ class ReaderView extends ItemView {
       if (!dragging) return;
       dragging = false;
       this._lastTouch = Date.now();
-      this.content.style.transition = this.plugin.settings.animate ? 'transform 0.2s ease' : 'none';
       const tc = e.changedTouches[0];
       const dx = tc.clientX - x0, dy = tc.clientY - y0, dt = Date.now() - t0;
       const selection = vp.ownerDocument.getSelection();
       if (selection && !selection.isCollapsed && this.content.contains(selection.anchorNode)) {
         highlightTap = null;
-        decided = false; horizontal = false; menuSwipe = false; this.applyTransform(); return;
+        decided = false; horizontal = false; menuSwipe = false; return;
       }
+      this.content.style.transition = this.plugin.settings.animate ? 'transform 0.2s ease' : 'none';
       const tap = highlightTap; highlightTap = null;
       if (tap && Math.abs(dx) < TAP_MOVE && Math.abs(dy) < TAP_MOVE && dt < TAP_MS) {
         e.preventDefault(); e.stopPropagation();
@@ -4407,7 +4732,7 @@ class ReaderSettingTab extends PluginSettingTab {
           try { window.open('supernote-bridge://digest-settings'); }
           catch (error) { new Notice('Supernote Bridge did not open. Install or update it, then retry.'); }
         }))
-        .addButton((button) => button.setButtonText('Reconnect Quick Digest').setTooltip('Reset local trust so Bridge can ask permission again.')
+        .addButton((button) => button.setButtonText('Reset Digest permission').setTooltip('Ask for Digest access again on the next capture.')
           .onClick(() => this.plugin.reconnectQuickDigest()));
     }
 
@@ -5584,16 +5909,20 @@ class MdReaderPlugin extends Plugin {
   reconnectQuickDigest() {
     const vault = digestVaultName(this.app);
     if (!vault || !resetQuickCredentials(vault, digestLocalStorage())) {
-      new Notice('Could not reset local Quick Digest access. Check this device’s local storage.'); return false;
+      new Notice('Could not reset Digest permission. Check this device’s local storage.'); return false;
     }
-    new Notice('Quick Digest access reset. The next quick save will ask Bridge to confirm permission again.');
+    new Notice('Digest permission reset. The next capture will ask for permission again.');
     return true;
   }
 
   localDigestReceipt(annotationId) {
     if (!DIGEST_REQUEST_RE.test(String(annotationId || ''))) return null;
     const vault = digestVaultName(this.app);
-    return vault ? readDigestAnnotationLinks(vault, digestLocalStorage()).receipts[annotationId] || null : null;
+    if (!vault) return null;
+    const links = readDigestAnnotationLinks(vault, digestLocalStorage());
+    if (links.receipts[annotationId]) return links.receipts[annotationId];
+    const request = Object.keys(links.requests).find((key) => links.requests[key] === annotationId);
+    return request ? { request } : null;
   }
 
   associateDigestAnnotation(vault, request, annotationId) {
@@ -5610,6 +5939,7 @@ class MdReaderPlugin extends Plugin {
     const annotation = links.pending[request];
     if (!annotation) return true; // legacy or pre-association Reader request
     delete links.pending[request];
+    if (status === 'cancelled') delete links.requests[request];
     if (status === 'saved' && DIGEST_REQUEST_RE.test(annotation) && Number.isSafeInteger(id) && id > 0) {
       links.receipts[annotation] = { request, id };
     }
