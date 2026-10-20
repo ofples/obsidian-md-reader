@@ -16,7 +16,7 @@ const css = readFileSync(join(__dirname, '../styles.css'), 'utf8');
     page.on('console', message => { if (message.type() === 'error') console.error('browser:', message.text()); });
     await page.setContent(`<style>
       * { box-sizing: border-box; } body { margin: 0; font: 18px Georgia; }
-      body { --font-text: Georgia; --font-text-size: 18px; --background-primary: #faf8f3;
+      body { --font-text: Georgia; --font-text-size: 18px; --background-primary: #faf8f3; --text-highlight-bg: transparent;
         --background-modifier-border: #ccc; --text-normal: #262421; --text-muted: #666; --interactive-accent: #6b5d9c; }
       .workspace-leaf-content { height: 100vh; } .modal-container { z-index: 100; position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
       .modal-bg { position: absolute; inset: 0; background: #000; opacity: .6; }
@@ -690,17 +690,30 @@ const css = readFileSync(join(__dirname, '../styles.css'), 'utf8');
     });
     await page.evaluate(() => view.toggleSelectedHighlight(view._selectedQuote));
     await check('saved highlight preserves source text and page-chip nodes without changing pagination', () => {
+      const mark = view.content.querySelector('.hr-persistent-highlight');
       const okay = view.content.textContent === textBeforeHighlight && view.content.querySelectorAll('.st-page-link').length === chipCountBefore &&
-        rawBook === sourceBeforeHighlight && view.totalPages === pagesBeforeHighlight && !!(CSS.highlights?.has('md-reader-persistent') || view.content.querySelector('.hr-persistent-highlight'));
+        rawBook === sourceBeforeHighlight && view.totalPages === pagesBeforeHighlight && !!(CSS.highlights?.has('md-reader-persistent') || mark) &&
+        (!mark || getComputedStyle(mark).backgroundColor === 'rgb(184, 184, 184)');
       return okay || { sameText: view.content.textContent === textBeforeHighlight, chipCount: view.content.querySelectorAll('.st-page-link').length,
         chipCountBefore, sameSource: rawBook === sourceBeforeHighlight, pages: view.totalPages, pagesBeforeHighlight,
         cssHighlight: CSS.highlights?.has('md-reader-persistent'), markCount: view.content.querySelectorAll('.hr-persistent-highlight').length,
+        markBackground: mark && getComputedStyle(mark).backgroundColor,
         record: window.highlightRecord, indexes: view.textIndex()?.text.includes(window.highlightRecord?.quote),
         context: window.highlightContext, selected: view._selectedQuote?.text, actionSelection: view._actionSelection?.text,
         persistCalled: window.persistCalled, match: window.highlightCandidates(view.textIndex()?.text || '', window.highlightRecord),
         indexedBefore: view.textIndex()?.text.slice(Math.max(0, view.textIndex().text.indexOf(window.highlightRecord?.quote) - 260), view.textIndex().text.indexOf(window.highlightRecord?.quote)),
         indexedAfter: view.textIndex()?.text.slice(view.textIndex().text.indexOf(window.highlightRecord?.quote) + (window.highlightRecord?.quote || '').length, view.textIndex().text.indexOf(window.highlightRecord?.quote) + (window.highlightRecord?.quote || '').length + 260),
         notices: [...document.querySelectorAll('.notice')].map((el) => el.textContent) };
+    });
+    await check('saved highlight keeps a Reader-owned fill in light and dark themes', () => {
+      const mark = view.content.querySelector('.hr-persistent-highlight');
+      if (!mark) return false;
+      const light = getComputedStyle(mark).backgroundColor;
+      document.body.classList.add('theme-dark');
+      const dark = getComputedStyle(mark).backgroundColor;
+      const darkText = getComputedStyle(mark).color;
+      document.body.classList.remove('theme-dark');
+      return light === 'rgb(184, 184, 184)' && dark === 'rgb(72, 72, 72)' && darkText === 'rgb(255, 255, 255)';
     });
     await check('a pending vault refresh never replaces text nodes or transforms the page during native selection', async () => {
       window.lastMenu?.hide(); document.getSelection().removeAllRanges();
@@ -735,7 +748,9 @@ const css = readFileSync(join(__dirname, '../styles.css'), 'utf8');
       const stableThroughMenu = mark.isConnected && mark.firstChild === node && transformCalls === 0;
       window.lastMenu?.hide(); await new Promise(resolve => setTimeout(resolve, 50));
       view.applyTransform = originalTransform;
-      return stable && stableThroughMenu && !mark.isConnected && !!view.content.querySelector('.hr-persistent-highlight') && !view._selectionGesture;
+      const restoredMark = view.content.querySelector('.hr-persistent-highlight');
+      return stable && stableThroughMenu && !mark.isConnected && !!restoredMark &&
+        getComputedStyle(restoredMark).backgroundColor === 'rgb(184, 184, 184)' && !view._selectionGesture;
     });
     await check('short tap on a saved highlight opens its contextual actions and stops page navigation', async () => {
       let mark = view.content.querySelector('.hr-persistent-highlight');
@@ -747,8 +762,11 @@ const css = readFileSync(join(__dirname, '../styles.css'), 'utf8');
       const pageBefore = view.page;
       mark.dispatchEvent(click);
       const titles = window.lastMenu?.items.map((item) => item.title) || [];
-      const quick = window.lastMenu?.items.find((entry) => entry.title === 'Create Digest');
-      const result = quick ? await quick.action() : null;
+      const quick = window.lastMenu?.items.find((entry) => entry.title === 'Quick Digest');
+      const create = window.lastMenu?.items.find((entry) => entry.title === 'Create Digest');
+      const quickResult = quick ? await quick.action() : null;
+      const quickDispatched = openedUris.at(-1);
+      const result = create ? await create.action() : null;
       const dispatched = openedUris.at(-1);
       plugin.localDigestReceipt = () => ({ request: 'f'.repeat(64), id: 42 });
       mark = view.content.querySelector('.hr-persistent-highlight');
@@ -760,8 +778,11 @@ const css = readFileSync(join(__dirname, '../styles.css'), 'utf8');
       const receipt = window.lastMenu?.items.find((entry) => entry.title === 'Open Digest');
       if (receipt) receipt.action();
       const okay = click.defaultPrevented && view.page === pageBefore && titles.some((title) => title.startsWith('Copy highlight')) &&
-        titles.some((title) => title.startsWith('Remove highlight')) && titles.includes('Create Digest') &&
+        titles.some((title) => title.startsWith('Remove highlight')) && titles.includes('Quick Digest') && titles.includes('Create Digest') &&
         !titles.includes('Digest with note…') && result && dispatched.startsWith('supernote-bridge://digest?') &&
+        quickResult && JSON.parse(new URL(quickDispatched).searchParams.get('delivery')).openNative === false &&
+        JSON.parse(new URL(dispatched).searchParams.get('delivery')).openNative === true &&
+        JSON.parse(new URL(quickDispatched).searchParams.get('payload')).requestId === JSON.parse(new URL(dispatched).searchParams.get('payload')).requestId &&
         JSON.parse(new URL(dispatched).searchParams.get('payload')).text === 'Paragraph 12:' && !!receipt &&
         openedUris.at(-1) === 'supernote-bridge://digest-receipt?request=' + 'f'.repeat(64) + '&id=42';
       return okay || { clickPrevented: click.defaultPrevented, beforePage: pageBefore, page: view.page, titles,

@@ -11,7 +11,8 @@ const source = readFileSync(SRC, 'utf8') +
   '\nmodule.exports.__digestTest = { digestSelectionText, digestSafeVaultPath, readDigestState, writeDigestState,' +
   ' validateDigestResult, validateDigestNote, normalizeDigestField, digestRequestId, normalizeHighlightText, highlightIdentityId,' +
  ' parseHighlightRecord, highlightRecordMarkdown, highlightCandidates, relocatedHighlightCandidate, makeQuickEnvelope, validQuickCallback, readQuickCredentials,' +
-  ' readQuickPending, writeQuickPending, resetQuickCredentials, readDigestAnnotationLinks, digestRangeContext, ReaderView, MdReaderPlugin, DIGEST_RESULT_ACTION };\n';
+ ' readQuickPending, writeQuickPending, resetQuickCredentials, readDigestAnnotationLinks, digestRangeContext, ReaderView, MdReaderPlugin, DIGEST_RESULT_ACTION,' +
+ ' digestDeliveryJson, validDigestCategoryName, normalizeDigestCategorySetting, DIGEST_CATEGORY_LIMIT };\n';
 const notices = [];
 class MockTFile {
   constructor(path, content = '') { this.path = path; this.content = content; this.extension = path.split('.').pop(); this.basename = path.split('/').at(-1).replace(/\.[^.]+$/, ''); this.stat = { mtime: 1, size: content.length }; }
@@ -106,6 +107,17 @@ assert.equal(T.validateDigestResult({ vault, request: 123, status: 'saved', id: 
 assert.equal(T.validateDigestResult({ vault, request: requestId, status: 'saved', id: '1', quote: 'private' }), null, 'callback rejects extra fields');
 assert.equal(T.validateDigestResult({ vault, request: requestId, status: 'saved', id: '1', action: 'wrong' }), null);
 assert.equal(T.validateDigestResult({ vault, request: requestId, status: 'uncertain', quick: quickClient }), null, 'Bridge quick client is legal only on its saved acknowledgment');
+assert.equal(T.validateDigestResult({ vault, request: requestId, status: 'cancelled', reason: 'category-not-found' }).reason, 'category-not-found',
+  'the known category failure reason is accepted on a cancellation callback');
+assert.equal(T.validateDigestResult({ vault, request: requestId, status: 'cancelled', reason: 'arbitrary-message' }), null,
+  'callback reason text is restricted to static actionable categories');
+assert.equal(T.validDigestCategoryName('A'.repeat(128)), true);
+assert.equal(T.validDigestCategoryName('A'.repeat(129)), false);
+assert.equal(T.validDigestCategoryName('bad\nname'), false);
+assert.equal(T.normalizeDigestCategorySetting('  '), '');
+assert.equal(T.normalizeDigestCategorySetting('Study Notes'), 'Study Notes');
+assert.equal(T.normalizeDigestCategorySetting('  Study Notes  '), 'Study Notes', 'category labels trim surrounding whitespace');
+assert.equal(T.normalizeDigestCategorySetting('Study\tNotes'), null);
 assert.equal(T.normalizeDigestField('  A\n B\t 😀  ', 256), 'A B 😀');
 assert.equal(T.normalizeDigestField('😀x', 1), '', 'truncation avoids a partial surrogate pair');
 assert.equal(T.normalizeHighlightText('first\nline 😀', 12), 'first line');
@@ -176,6 +188,26 @@ try {
   const vector = await T.makeQuickEnvelope(fixedVault, '{"text":"synthetic नमस्ते"}', requestId, quickStorage);
   assert.equal(new URLSearchParams(vector.query).get('signature'), '2c63fbce6fd7812c95149fb1948bcfdd2040e5d2261bf16cdee5e5e932715206',
     'HMAC implementation matches independent Unicode known-answer vector');
+  const bridgeVectorClient = 'b'.repeat(32), bridgeVectorSecret = 'c'.repeat(64);
+  quickStorage.setItem('md-reader-quick-v1:' + encodeURIComponent(fixedVault), JSON.stringify({ client: bridgeVectorClient, secret: bridgeVectorSecret, trusted: true }));
+  const bridgeVectorPayload = '{"version":1,"requestId":"' + 'a'.repeat(64) + '","text":"Digest line\\nsecond\\tline 😀","origin":{"vault":"Vedas","file":"Satsang/2610.md","heading":"Reflection","before":"before","after":"after"}}';
+  const deliveryJSON = '{"openNative":false,"categoryName":"Study Notes"}';
+  const deliveryVector = await T.makeQuickEnvelope(fixedVault, bridgeVectorPayload, requestId, quickStorage, deliveryJSON);
+  const deliveryParams = new URLSearchParams(deliveryVector.query);
+  assert.equal(deliveryParams.get('signature'), 'ec5426dee0a752cd78da56a324114a47c0e345e34020b38d673b7ca690473898',
+    'optional delivery uses the Bridge Android known-answer signature');
+  assert.equal(deliveryParams.get('delivery'), deliveryJSON, 'the signed delivery is carried as exact JSON');
+  const deliveryHash = createHash('sha256').update(deliveryJSON, 'utf8').digest('hex');
+  const tamperedDeliveryJSON = '{"openNative":true,"categoryName":"Study Notes"}';
+  const tamperedSignature = createHmac('sha256', Buffer.from(bridgeVectorSecret, 'hex'))
+    .update('supernote-bridge-quick-v1\n' + bridgeVectorClient + '\n1792291200000\n' + bridgeVectorPayload +
+      '\ndelivery-v1:' + deliveryHash, 'utf8').digest('hex');
+  const tamperedHash = createHash('sha256').update(tamperedDeliveryJSON, 'utf8').digest('hex');
+  const tamperedExpected = createHmac('sha256', Buffer.from(bridgeVectorSecret, 'hex'))
+    .update('supernote-bridge-quick-v1\n' + bridgeVectorClient + '\n1792291200000\n' + bridgeVectorPayload +
+      '\ndelivery-v1:' + tamperedHash, 'utf8').digest('hex');
+  assert.equal(deliveryParams.get('signature'), tamperedSignature, 'signature covers the exact raw delivery hash');
+  assert.notEqual(deliveryParams.get('signature'), tamperedExpected, 'changing openNative invalidates the delivery signature');
 } finally { Date.now = oldNow; }
 
 const canonicalSource = '---\nnomad_transcripts: true\n---\n\nA source paragraph with an excerpt.\n';
@@ -249,7 +281,7 @@ assert.equal(annotationFiles.has(twinPath), false, 'removal prevents duplicate s
 assert.equal(createHash('sha256').update(sourceFile.content).digest('hex'), canonicalHash);
 
 const stateKey = 'md-reader-digest-v1:' + encodeURIComponent(vault);
-const state = { version: 1, requests: { [requestId]: 'pending' } };
+const state = { version: 1, requests: { [requestId]: 'pending' }, deliveries: {} };
 assert.equal(T.writeDigestState(vault, storage, state), true);
 assert.deepEqual(T.readDigestState(vault, storage), state);
 
@@ -299,6 +331,8 @@ const quickHandoff = new URL(window.opened.at(-1));
 assert.equal(quickHandoff.searchParams.get('mode'), 'quick');
 assert.equal(quickHandoff.searchParams.get('client'), quickClient);
 assert.equal(quickHandoff.searchParams.get('setup'), quickSecret);
+assert.deepEqual(JSON.parse(quickHandoff.searchParams.get('delivery')), { openNative: true },
+  'legacy quick callers default to the existing native-entry behavior');
 assert.equal(JSON.parse(quickHandoff.searchParams.get('payload')).requestId, request);
 assert.equal(JSON.parse(quickHandoff.searchParams.get('payload')).text, 'A useful excerpt', 'quick auth does not alter the v1 payload');
 assert.equal(await reader.saveSelectedDigest(selection), request, 'retry reuses the deterministic pending request id');
@@ -309,17 +343,72 @@ assert.equal(T.writeDigestState(vault, storage, savedState), true);
 assert.equal(await reader.saveSelectedDigest(selection), request, 'saved request reopens Bridge with the same deterministic identity');
 assert.equal(window.opened.length, 4, 'saved request reopens Bridge without generating a new handoff identity');
 assert.equal(JSON.parse(new URL(window.opened[3]).searchParams.get('payload')).requestId, payload.requestId);
-assert.ok(notices.includes('Opening saved Digest.'));
+assert.ok(notices.some((message) => message.includes('Review and save in Supernote Bridge')));
+const quickOnlyCount = window.opened.length;
+assert.equal(await reader.saveSelectedDigest(selection, 'quick', { openNative: false }), request,
+  'Quick Digest keeps the payload identity shared with Create Digest');
+assert.equal(window.opened.length, quickOnlyCount + 1);
+const quickOnlyUri = new URL(window.opened.at(-1));
+assert.equal(quickOnlyUri.searchParams.get('payload'), new URL(window.opened[1]).searchParams.get('payload'),
+  'Quick Digest does not include its delivery choice in the captured payload');
+assert.deepEqual(JSON.parse(quickOnlyUri.searchParams.get('delivery')), { openNative: false },
+  'Quick Digest requests silent delivery');
+assert.equal(T.readDigestState(vault, storage).requests[request], 'saved',
+  'retrying Quick does not downgrade a verified saved status to pending');
 const associationsBeforeReceiptOpen = digestAssociations;
 const receiptStateBeforeOpen = storage.getItem(stateKey);
 reader.plugin.localDigestReceipt = (id) => id === 'e'.repeat(64) ? { request, id: 23 } : null;
 const countBeforeReceiptOpen = window.opened.length;
-assert.equal(await reader.saveSelectedDigest(selection, 'quick'), request, 'saved annotation opens its known local receipt without rebuilding a Digest request');
-assert.equal(window.opened.length, countBeforeReceiptOpen + 1);
-assert.equal(window.opened.at(-1), 'supernote-bridge://digest-receipt?request=' + request + '&id=23',
-  'native edits do not make Reader resend the original excerpt payload');
+assert.equal(await reader.saveSelectedDigest(selection, 'quick', { openNative: false }), request, 'silent Quick Digest acknowledges its known saved receipt without native launch');
+assert.equal(window.opened.length, countBeforeReceiptOpen, 'Quick Digest never reopens native detail from a receipt');
 assert.equal(digestAssociations, associationsBeforeReceiptOpen, 'receipt reopen does not rewrite annotation association');
 assert.equal(storage.getItem(stateKey), receiptStateBeforeOpen, 'receipt reopen leaves request state unchanged');
+
+function categoryFlow(text, resolver, globalCategory = 'Global Default') {
+  const flow = Object.create(T.ReaderView.prototype);
+  const file = { path: 'Reading/category-' + text.slice(0, 12).replace(/\W/g, '-') + '.md', stat: { mtime: 31 } };
+  const root = mockSelectionRoot();
+  const snapshot = { file, sourcePath: file.path, sourceMtime: 31, renderGen: 1, text,
+    range: mockSelectionRange(text), contextRoot: root };
+  let persisted = 0;
+  const annotationId = createHash('sha256').update(text).digest('hex');
+  Object.assign(flow, { file, _renderGen: 1, _digestSelection: snapshot, content: root,
+    _digestCategoryResolver: resolver, app: reader.app,
+    plugin: { settings: { digestCategoryName: globalCategory },
+      persistHighlight: async () => { persisted++; return { id: annotationId }; },
+      associateDigestAnnotation: () => true },
+    applyPersistentHighlights: async () => {}, digestNotice: (message) => notices.push(message) });
+  return { flow, snapshot, persisted: () => persisted };
+}
+const overrideCase = categoryFlow('Source override category', async () => ({ categoryName: 'Source Notes' }));
+const overrideRequest = await overrideCase.flow.saveSelectedDigest(overrideCase.snapshot, 'quick', { openNative: false });
+assert.ok(overrideRequest);
+assert.deepEqual(JSON.parse(new URL(window.opened.at(-1)).searchParams.get('delivery')),
+  { openNative: false, categoryName: 'Source Notes' }, 'source override takes precedence over Reader default');
+const overrideState = T.readDigestState(vault, storage);
+const overridePayload = new URL(window.opened.at(-1)).searchParams.get('payload');
+const overrideRetry = categoryFlow('Source override category', async () => ({ categoryName: 'Changed Later' }));
+assert.equal(await overrideRetry.flow.saveSelectedDigest(overrideRetry.snapshot, 'quick', { openNative: false }), overrideRequest);
+assert.equal(new URL(window.opened.at(-1)).searchParams.get('payload'), overridePayload);
+assert.deepEqual(JSON.parse(new URL(window.opened.at(-1)).searchParams.get('delivery')),
+  { openNative: false, categoryName: 'Source Notes' }, 'retry preserves the original source category snapshot');
+assert.deepEqual(T.readDigestState(vault, storage).deliveries[overrideRequest], overrideState.deliveries[overrideRequest]);
+const inheritCase = categoryFlow('Inherit global category', async () => null, 'Reader Default');
+await inheritCase.flow.saveSelectedDigest(inheritCase.snapshot, 'quick', { openNative: false });
+assert.deepEqual(JSON.parse(new URL(window.opened.at(-1)).searchParams.get('delivery')),
+  { openNative: false, categoryName: 'Reader Default' }, 'missing source preference inherits Reader default');
+const emptyOverrideCase = categoryFlow('Explicitly uncategorized', async () => ({ categoryName: '' }), 'Reader Default');
+await emptyOverrideCase.flow.saveSelectedDigest(emptyOverrideCase.snapshot, 'quick', { openNative: false });
+assert.deepEqual(JSON.parse(new URL(window.opened.at(-1)).searchParams.get('delivery')),
+  { openNative: false, categoryName: '' }, 'blank source override explicitly selects Uncategorized');
+for (const badCategory of ['A'.repeat(129), 'invalid\nname']) {
+  const invalidCategoryCase = categoryFlow('Reject category ' + badCategory.length + badCategory.slice(0, 2), async () => ({ categoryName: badCategory }));
+  const openedBeforeBadCategory = window.opened.length;
+  assert.equal(await invalidCategoryCase.flow.saveSelectedDigest(invalidCategoryCase.snapshot, 'quick', { openNative: false }), null,
+    'invalid source category is rejected before dispatch');
+  assert.equal(invalidCategoryCase.persisted(), 0, 'invalid source category is rejected before Reader highlight persistence');
+  assert.equal(window.opened.length, openedBeforeBadCategory);
+}
 
 const associationFailure = Object.create(T.ReaderView.prototype);
 const associationSelection = { ...selection, text: 'Excerpt without local association', sourceMtime: 10 };
@@ -361,12 +450,15 @@ nativeFlow._digestSelection = flowSelection;
 const originalOpen = window.open;
 const originalOpenCount = window.opened.length;
 window.open = function(uri) { assert.equal(paintedBeforeOpen, true, 'standalone highlight is visible before native handoff'); this.opened.push(uri); return {}; };
-const flowRequest = await nativeFlow.saveSelectedDigest(flowSelection, 'quick');
+const flowRequest = await nativeFlow.saveSelectedDigest(flowSelection, 'quick', { openNative: false });
 assert.ok(flowRequest);
 assert.deepEqual(nativePlugin.localDigestReceipt(flowAnnotation), { request: flowRequest }, 'dispatched request has an idless native lookup route');
 assert.equal(T.readDigestAnnotationLinks(vault, storage).receipts[flowAnnotation], undefined, 'dispatch does not manufacture a SAVED receipt');
-assert.equal(await nativeFlow.saveSelectedDigest(flowSelection, 'quick'), flowRequest, 'repeat opens the authoritative native receipt route');
-assert.equal(window.opened.at(-1), 'supernote-bridge://digest-receipt?request=' + flowRequest);
+const beforeQuickRepeat = window.opened.length;
+assert.equal(await nativeFlow.saveSelectedDigest(flowSelection, 'quick', { openNative: false }), flowRequest, 'repeat Quick uses its stable request identity');
+assert.equal(window.opened.length, beforeQuickRepeat + 1, 'unconfirmed Quick repeat forwards the same request ID to Bridge');
+assert.equal(new URL(window.opened.at(-1)).searchParams.get('payload'), new URL(window.opened.at(-2)).searchParams.get('payload'));
+assert.equal(JSON.parse(new URL(window.opened.at(-1)).searchParams.get('delivery')).openNative, false);
 assert.equal(nativeFlow.openDigestReceipt({ request: flowRequest, id: -1 }), false, 'asserted native IDs remain strictly validated');
 assert.equal(nativePlugin.handleDigestResult({ vault, request: flowRequest, status: 'cancelled' }), true);
 assert.equal(nativePlugin.localDigestReceipt(flowAnnotation), null, 'cancelled dispatch removes its idless route');
@@ -376,13 +468,14 @@ nativePlugin.persistHighlight = async () => ({ id: uncertainAnnotation });
 const uncertainSelection = { ...flowSelection, text: 'A capture with an ambiguous native result' };
 uncertainSelection.range = mockSelectionRange(uncertainSelection.text);
 nativeFlow._digestSelection = uncertainSelection;
-const uncertainRequest = await nativeFlow.saveSelectedDigest(uncertainSelection, 'quick');
+const uncertainRequest = await nativeFlow.saveSelectedDigest(uncertainSelection, 'quick', { openNative: false });
 assert.equal(nativePlugin.handleDigestResult({ vault, request: uncertainRequest, status: 'uncertain' }), true);
 assert.equal(T.readDigestState(vault, storage).requests[uncertainRequest], 'uncertain');
 assert.deepEqual(nativePlugin.localDigestReceipt(uncertainAnnotation), { request: uncertainRequest }, 'uncertain capture retains only an authoritative native lookup');
 const createsBeforeUncertainOpen = window.opened.filter((uri) => uri.startsWith('supernote-bridge://digest?')).length;
-assert.equal(await nativeFlow.saveSelectedDigest(uncertainSelection, 'quick'), uncertainRequest);
-assert.equal(window.opened.at(-1), 'supernote-bridge://digest-receipt?request=' + uncertainRequest);
+const beforeUncertainRetry = window.opened.length;
+assert.equal(await nativeFlow.saveSelectedDigest(uncertainSelection, 'quick', { openNative: false }), null);
+assert.equal(window.opened.length, beforeUncertainRetry, 'uncertain result cannot launch a duplicate write or native receipt');
 assert.equal(window.opened.filter((uri) => uri.startsWith('supernote-bridge://digest?')).length, createsBeforeUncertainOpen, 'uncertain result can never resend the native write');
 assert.equal(T.readDigestAnnotationLinks(vault, storage).receipts[uncertainAnnotation], undefined, 'uncertain result never invents a SAVED ID');
 nativePlugin.persistHighlight = async () => { standaloneSaved = true; return { id: flowAnnotation }; };
@@ -394,7 +487,7 @@ const failSelection = { ...flowSelection, text: 'A separate capture whose Androi
 failSelection.range = mockSelectionRange(failSelection.text);
 nativeFlow._digestSelection = failSelection;
 window.open = () => { throw new Error('synthetic dispatch failure'); };
-assert.equal(await nativeFlow.saveSelectedDigest(failSelection, 'quick'), null);
+assert.equal(await nativeFlow.saveSelectedDigest(failSelection, 'quick', { openNative: false }), null);
 assert.equal(standaloneSaved, true, 'failed Android dispatch keeps the standalone highlight');
 const failedPayload = { version: 1, requestId: '', text: failSelection.text, origin: { vault, file: nativeFlow.file.path } };
 const failedRequest = await T.digestRequestId(failedPayload);
@@ -425,8 +518,9 @@ selection.contextRoot = staleMtime.content;
 staleMtime.plugin = reader.plugin;
 staleMtime.app = { vault: { getName: () => vault, cachedRead: async () => { selectedFile.stat.mtime = 11; return '# changed source'; } } };
 staleMtime.digestNotice = (message) => notices.push(message);
+const handoffsBeforeStale = window.opened.length;
 assert.equal(await staleMtime.saveSelectedDigest(selection), null, 'file modification invalidates a captured passage before handoff');
-assert.equal(window.opened.length, 5, 'changed source text is never sent');
+assert.equal(window.opened.length, handoffsBeforeStale, 'changed source text is never sent');
 selectedFile.stat.mtime = 10;
 
 const staleRange = Object.create(T.ReaderView.prototype);
@@ -440,7 +534,7 @@ staleRange._digestSelectionResolver = async () => { range.collapsed = true; retu
 staleRange.app = reader.app;
 staleRange.digestNotice = (message) => notices.push(message);
 assert.equal(await staleRange.saveSelectedDigest(selection), null, 'collapsed range during async lookup invalidates the selection');
-assert.equal(window.opened.length, 5, 'collapsed selection is never sent');
+assert.equal(window.opened.length, handoffsBeforeStale, 'collapsed selection is never sent');
 range.collapsed = false;
 
 for (const change of ['native-range', 'range-text', 'active-action']) {
@@ -539,6 +633,21 @@ cancelledState.requests[cancelledId] = 'pending';
 T.writeDigestState(vault, storage, cancelledState);
 assert.equal(plugin.handleDigestResult({ vault, request: cancelledId, status: 'cancelled' }), true, 'cancel callback is accepted for a pending id');
 assert.equal(T.readDigestState(vault, storage).requests[cancelledId], 'cancelled', 'cancel state remains retryable');
+
+const categoryRetryCase = categoryFlow('Category retry after validation failure', async () => ({ categoryName: 'First Name' }));
+const categoryRetryId = await categoryRetryCase.flow.saveSelectedDigest(categoryRetryCase.snapshot, 'quick', { openNative: false });
+const categoryRetryState = T.readDigestState(vault, storage);
+assert.deepEqual(categoryRetryState.deliveries[categoryRetryId], { categoryName: 'First Name' });
+assert.equal(plugin.handleDigestResult({ vault, request: categoryRetryId, status: 'cancelled', reason: 'category-not-found' }), true,
+  'Bridge category failure is accepted as a bounded cancelled callback');
+assert.equal(T.readDigestState(vault, storage).requests[categoryRetryId], 'cancelled');
+assert.equal(Object.hasOwn(T.readDigestState(vault, storage).deliveries, categoryRetryId), false,
+  'a confirmed no-write category failure releases the pinned category for correction');
+const correctedCategoryRetry = categoryFlow('Category retry after validation failure', async () => ({ categoryName: 'Corrected Name' }));
+assert.equal(await correctedCategoryRetry.flow.saveSelectedDigest(correctedCategoryRetry.snapshot, 'quick', { openNative: false }), categoryRetryId,
+  'category correction keeps the same excerpt request identity');
+assert.deepEqual(JSON.parse(new URL(window.opened.at(-1)).searchParams.get('delivery')),
+  { openNative: false, categoryName: 'Corrected Name' }, 'confirmed category cancellation retries with the corrected category');
 
 const quickCallbackId = 'd'.repeat(64);
 const quickCallbackState = T.readDigestState(vault, storage);

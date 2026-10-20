@@ -48,6 +48,7 @@ const DEFAULT_SETTINGS = {
   showTimeLeft: true,
   footnotes: 'popup',     // how [^1] footnotes show: 'popup' | 'inline' | 'hide'
   quoteFolder: 'Books/Quotes',
+  digestCategoryName: '', // '' = let Supernote Bridge use its current default category
   importFolder: '',       // vault folder for imported/converted books ('' = vault root)
 };
 
@@ -63,6 +64,7 @@ const TINT_LABEL = { none: 'optTintNone', sepia: 'optTintSepia', cream: 'optTint
 const DIGEST_TEXT_LIMIT = 15000;
 const DIGEST_JSON_LIMIT = 40000;
 const DIGEST_URI_LIMIT = 150000;
+const DIGEST_CATEGORY_LIMIT = 128;
 const DIGEST_REQUEST_RE = /^[a-f0-9]{64}$/;
 const DIGEST_RESULT_ACTION = 'md-reader-digest-result';
 const DIGEST_IGNORE_SELECTOR = '.st-page-link,.st-digest-anchor,button,[role="button"]:not(.hr-persistent-highlight),.hr-ui,[data-selection-ignore]';
@@ -251,7 +253,7 @@ function setDocumentPersistentHighlights(doc, view, ranges) {
   else css.highlights.delete('md-reader-persistent');
 }
 
-async function makeQuickEnvelope(vault, json, requestId, storage) {
+async function makeQuickEnvelope(vault, json, requestId, storage, deliveryJSON) {
   let credentials = readQuickCredentials(vault, storage);
   if (!credentials) {
     if (!globalThis.crypto?.getRandomValues || !globalThis.crypto?.subtle?.importKey || !globalThis.crypto?.subtle?.sign) {
@@ -267,10 +269,17 @@ async function makeQuickEnvelope(vault, json, requestId, storage) {
   const time = String(Date.now());
   const key = await globalThis.crypto.subtle.importKey('raw', new Uint8Array(credentials.secret.match(/../g).map((x) => parseInt(x, 16))),
     { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const message = 'supernote-bridge-quick-v1\n' + credentials.client + '\n' + time + '\n' + json;
+  let message = 'supernote-bridge-quick-v1\n' + credentials.client + '\n' + time + '\n' + json;
+  if (deliveryJSON !== undefined) {
+    if (typeof deliveryJSON !== 'string') throw new Error('Invalid Digest delivery options');
+    const deliveryHash = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(deliveryJSON));
+    const deliveryHashHex = Array.from(new Uint8Array(deliveryHash)).map((b) => b.toString(16).padStart(2, '0')).join('');
+    message += '\ndelivery-v1:' + deliveryHashHex;
+  }
   const signature = await globalThis.crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
   const sig = Array.from(new Uint8Array(signature)).map((b) => b.toString(16).padStart(2, '0')).join('');
   return { credentials, query: 'mode=quick&client=' + credentials.client + '&time=' + time + '&signature=' + sig +
+    (deliveryJSON === undefined ? '' : '&delivery=' + encodeURIComponent(deliveryJSON)) +
     (credentials.trusted ? '' : '&setup=' + credentials.secret) };
 }
 
@@ -340,6 +349,24 @@ function digestVaultName(app) {
 
 function digestIsAndroid() { return Platform.isAndroidApp === true || Platform.isAndroid === true; }
 
+function validDigestCategoryName(value) {
+  return typeof value === 'string' && value.length <= DIGEST_CATEGORY_LIMIT && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+}
+
+function normalizeDigestCategorySetting(value) {
+  if (!validDigestCategoryName(value)) return null;
+  return value.trim();
+}
+
+function digestDeliveryJson(openNative, categoryName, hasCategoryName) {
+  const delivery = { openNative: openNative === true };
+  if (hasCategoryName) {
+    if (!validDigestCategoryName(categoryName)) return null;
+    delivery.categoryName = categoryName;
+  }
+  return JSON.stringify(delivery);
+}
+
 function digestStoreKey(vault) { return 'md-reader-digest-v1:' + encodeURIComponent(vault); }
 
 function readDigestState(vault, storage) {
@@ -347,14 +374,22 @@ function readDigestState(vault, storage) {
     const raw = storage?.getItem(digestStoreKey(vault));
     const value = raw ? JSON.parse(raw) : null;
     if (!value || value.version !== 1 || !value.requests || typeof value.requests !== 'object' || Array.isArray(value.requests)) {
-      return { version: 1, requests: {} };
+      return { version: 1, requests: {}, deliveries: {} };
     }
     const requests = {};
     for (const [id, status] of Object.entries(value.requests)) {
       if (DIGEST_REQUEST_RE.test(id) && ['pending','saved','uncertain','cancelled'].includes(status)) requests[id] = status;
     }
-    return { version: 1, requests };
-  } catch (_) { return { version: 1, requests: {} }; }
+    const deliveries = {};
+    if (value.deliveries && typeof value.deliveries === 'object' && !Array.isArray(value.deliveries)) {
+      for (const [id, delivery] of Object.entries(value.deliveries)) {
+        if (!DIGEST_REQUEST_RE.test(id) || !delivery || typeof delivery !== 'object' || Array.isArray(delivery)) continue;
+        if (delivery.categoryName === undefined) deliveries[id] = {};
+        else if (validDigestCategoryName(delivery.categoryName)) deliveries[id] = { categoryName: delivery.categoryName };
+      }
+    }
+    return { version: 1, requests, deliveries };
+  } catch (_) { return { version: 1, requests: {}, deliveries: {} }; }
 }
 
 function writeDigestState(vault, storage, state) {
@@ -365,7 +400,7 @@ function writeDigestState(vault, storage, state) {
 function validateDigestResult(params) {
   if (!params || typeof params !== 'object' || Array.isArray(params)) return null;
   const keys = Object.keys(params);
-  if (keys.some((key) => !['action','vault','request','status','id','quick'].includes(key)) ||
+  if (keys.some((key) => !['action','vault','request','status','id','quick','reason'].includes(key)) ||
       (params.action !== undefined && params.action !== DIGEST_RESULT_ACTION) ||
       !keys.includes('vault') || typeof params.vault !== 'string' || !params.vault || params.vault.length > 256 ||
       !keys.includes('request') || typeof params.request !== 'string' || !keys.includes('status') || !DIGEST_REQUEST_RE.test(params.request) ||
@@ -375,8 +410,9 @@ function validateDigestResult(params) {
   } else if (keys.includes('id')) return null;
   if (params.quick !== undefined && (typeof params.quick !== 'string' || !/^[a-f0-9]{32}$/.test(params.quick))) return null;
   if (params.quick !== undefined && params.status !== 'saved') return null;
+  if (params.reason !== undefined && (params.status !== 'cancelled' || !['category-not-found','category-ambiguous'].includes(params.reason))) return null;
   return { vault: params.vault, requestId: params.request, status: params.status,
-    id: params.status === 'saved' ? Number(params.id) : null, quick: params.quick || null };
+    id: params.status === 'saved' ? Number(params.id) : null, quick: params.quick || null, reason: params.reason || null };
 }
 
 function validateDigestNote(note) {
@@ -540,7 +576,17 @@ const STRINGS = {
     quoteFolderDesc: 'One Markdown note per book. Path inside the vault; empty uses Books/Quotes.',
     nativeDigestSettings: 'Native Digests',
     configureDigestDefaults: 'Digest preferences',
-    digestDefaultsHint: 'Create a Digest from selected text, then use Edit in its native entry to add a note.',
+    digestDefaultsHint: 'Create Digest opens the saved entry. Quick Digest saves it silently so you can keep reading.',
+    digestCategoryName: 'Default category',
+    digestCategoryDesc: 'Exact native category name. Blank uses the device default, usually Uncategorized. Maximum 128 characters.',
+    digestCategoryInvalid: 'Digest category must be at most 128 characters and contain no control characters.',
+    digestCategorySourceInvalid: 'The source Digest category is invalid. Fix its Transcripts source settings, then retry.',
+    digestCategorySourceFailed: 'Could not read this source’s Digest category. Refresh the Reader and try again.',
+    digestCategoryNotFound: 'Digest category was not found. Check the exact category name in Digest preferences or choose Uncategorized.',
+    digestCategoryAmbiguous: 'More than one Digest category has this name. Rename the categories so the name is unique, then retry.',
+    digestSaving: 'Saving Digest… Reader will confirm when Bridge reports it saved.',
+    digestAlreadySaved: 'Digest already saved. Find it in the native Digest list.',
+    digestSaved: 'Digest saved.',
     quoteTitle: 'Quotes',
     sPaddingDesc: 'Empty space at the top and bottom of the page',
     cmdTint: 'Cycle page tint',
@@ -1977,6 +2023,10 @@ class ReaderView extends ItemView {
       (pageLinks.capabilities?.includes?.('selectionProvenance') || pageLinks.capabilities?.selectionProvenance === true) &&
       typeof pageLinks.selectionSource === 'function';
     this._digestSelectionResolver = canResolveSelection ? pageLinks.selectionSource.bind(pageLinks) : null;
+    const canResolveDigestPreferences = pageLinks?.apiVersion === 1 &&
+      (pageLinks.capabilities?.includes?.('digestPreferences') || pageLinks.capabilities?.digestPreferences === true) &&
+      typeof pageLinks.digestPreferences === 'function';
+    this._digestCategoryResolver = canResolveDigestPreferences ? pageLinks.digestPreferences.bind(pageLinks) : null;
     let linksEnabled = false;
     if (compatible && typeof pageLinks.enabled === 'function') {
       try { linksEnabled = !!pageLinks.enabled(); }
@@ -3124,7 +3174,10 @@ class ReaderView extends ItemView {
 
   addSelectionMenuItems(menu, quote, includeQuote) {
     if (digestIsAndroid()) {
-      menu.addItem((i) => i.setTitle('Create Digest').setIcon('bookmark-plus').onClick(() => this.saveSelectedDigest(quote, 'quick')));
+      menu.addItem((i) => i.setTitle('Quick Digest').setIcon('bookmark-plus')
+        .onClick(() => this.saveSelectedDigest(quote, 'quick', { openNative: false })));
+      menu.addItem((i) => i.setTitle('Create Digest').setIcon('bookmark-plus')
+        .onClick(() => this.saveSelectedDigest(quote, 'quick', { openNative: true })));
     }
     menu.addItem((i) => i.setTitle('Highlight').setIcon('highlighter').onClick(() => this.toggleSelectedHighlight(quote)));
     menu.addItem((i) => i.setTitle('Copy').setIcon('copy').onClick(() => this.copySelectedText(quote)));
@@ -3385,11 +3438,13 @@ class ReaderView extends ItemView {
       menu.addItem((item) => item.setTitle('Remove highlight' + (valid.length > 1 ? ' · ' + label : '')).setIcon('trash-2')
         .onClick(() => this.removePersistentHighlight(record)));
       const receipt = this.plugin.localDigestReceipt?.(record.id);
-      if (!receipt && digestIsAndroid()) {
+      if (digestIsAndroid()) {
+        menu.addItem((item) => item.setTitle('Quick Digest' + (valid.length > 1 ? ' · ' + label : '')).setIcon('bookmark-plus')
+          .onClick(() => this.digestPersistentHighlight(entry, 'quick', { openNative: false })));
         menu.addItem((item) => item.setTitle('Create Digest' + (valid.length > 1 ? ' · ' + label : '')).setIcon('bookmark-plus')
-          .onClick(() => this.digestPersistentHighlight(entry, 'quick')));
+          .onClick(() => this.digestPersistentHighlight(entry, 'quick', { openNative: true })));
       }
-      if (receipt && digestIsAndroid()) {
+      if (receipt?.id != null && digestIsAndroid()) {
         menu.addItem((item) => item.setTitle('Open Digest').setIcon('external-link')
           .onClick(() => this.openDigestReceipt(receipt)));
       }
@@ -3439,12 +3494,12 @@ class ReaderView extends ItemView {
     }
   }
 
-  async digestPersistentHighlight(entry, mode) {
+  async digestPersistentHighlight(entry, mode, options) {
     const selected = this.selectedPersistentHighlight(entry);
     if (!selected) { new Notice('This highlight no longer matches the current text. Refresh the chapter before creating a Digest.'); return null; }
     const previous = this._digestSelection;
     this._digestSelection = selected;
-    try { return await this.saveSelectedDigest(selected, mode); }
+    try { return await this.saveSelectedDigest(selected, mode, options); }
     finally { if (this._digestSelection === selected) this._digestSelection = previous || null; }
   }
 
@@ -3471,9 +3526,10 @@ class ReaderView extends ItemView {
 
   digestNotice(message) { new Notice(message); }
 
-  async saveSelectedDigest(snapshot, mode = 'review') {
+  async saveSelectedDigest(snapshot, mode = 'review', options = {}) {
     if (!digestIsAndroid()) return null;
     mode = mode === 'quick' ? 'quick' : 'review';
+    const deliveryOptions = { openNative: options?.openNative !== false };
     if (this._digestPreparing) return null;
     if (snapshot) {
       if (!this.selectionSnapshotIsCurrent(snapshot)) { this.digestNotice('Select text in the current Reader chapter first.'); return null; }
@@ -3490,7 +3546,7 @@ class ReaderView extends ItemView {
     if (this.digestReviewButton) this.digestReviewButton.disabled = true;
     try {
       this.digestNotice('Preparing excerpt…');
-      return await this.prepareSelectedDigest(snapshot, mode);
+      return await this.prepareSelectedDigest(snapshot, mode, deliveryOptions);
     }
     catch (error) {
       console.error('MD Reader: Digest preparation failed', error);
@@ -3508,7 +3564,7 @@ class ReaderView extends ItemView {
     }
   }
 
-  async prepareSelectedDigest(snapshot, mode = 'review') {
+  async prepareSelectedDigest(snapshot, mode = 'review', deliveryOptions = {}) {
     const selected = snapshot || this._digestSelection;
     const isCurrent = () => {
       const active = this._digestSelection;
@@ -3574,9 +3630,6 @@ class ReaderView extends ItemView {
       return null;
     }
     if (!isCurrent()) { this.digestNotice('The Reader source changed before Digest handoff. Select the text again.'); return null; }
-    const annotation = await this.plugin.persistHighlight(selected, note, isCurrent);
-    if (!annotation) { this.digestNotice('Could not safely save this excerpt in Reader Highlights. Check its folder and select the text again.'); return null; }
-    if (!isCurrent()) { this.digestNotice('The Reader source changed while saving the highlight. Select the text again.'); return null; }
     const paintBeforeHandoff = async () => {
       const active = this._digestSelection;
       await this.applyPersistentHighlights(selected.renderGen, { allowPreparing: true });
@@ -3606,12 +3659,67 @@ class ReaderView extends ItemView {
     try { storage = window.localStorage; } catch (_) { storage = null; }
     const state = readDigestState(vault, storage);
     const existingStatus = state.requests[payload.requestId];
+    const stateBeforeDelivery = JSON.parse(JSON.stringify(state));
+    let deliveryJSON;
+    if (mode === 'quick') {
+      const globalCategory = normalizeDigestCategorySetting(this.plugin?.settings?.digestCategoryName ?? '');
+      if (globalCategory === null) { this.digestNotice(t('digestCategoryInvalid')); return null; }
+      let sourceHasCategory = false, sourceCategory;
+      const preferenceResolver = this._digestCategoryResolver;
+      if (preferenceResolver) {
+        let preferences;
+        try { preferences = await preferenceResolver(selected.sourcePath); }
+        catch (error) {
+          console.warn('MD Reader: source Digest preferences could not be read', error);
+          this.digestNotice(t('digestCategorySourceFailed')); return null;
+        }
+        if (!isCurrent()) { this.digestNotice('The Reader source changed while reading its Digest category. Select the text again.'); return null; }
+        if (preferences != null) {
+          if (typeof preferences !== 'object' || Array.isArray(preferences) ||
+              Object.keys(preferences).some((key) => key !== 'categoryName') ||
+              (preferences.categoryName !== undefined && !validDigestCategoryName(preferences.categoryName))) {
+            this.digestNotice(t('digestCategorySourceInvalid')); return null;
+          }
+          if (preferences.categoryName !== undefined) {
+            sourceHasCategory = true;
+            sourceCategory = normalizeDigestCategorySetting(preferences.categoryName);
+          }
+        }
+      }
+      if (existingStatus === 'cancelled') delete state.deliveries[payload.requestId];
+      const hasDeliverySnapshot = existingStatus !== 'cancelled' &&
+        Object.prototype.hasOwnProperty.call(state.deliveries, payload.requestId);
+      let categoryHasValue, categoryName;
+      if (hasDeliverySnapshot) {
+        const savedDelivery = state.deliveries[payload.requestId];
+        categoryHasValue = Object.prototype.hasOwnProperty.call(savedDelivery, 'categoryName');
+        categoryName = savedDelivery.categoryName;
+      } else if (sourceHasCategory) {
+        categoryHasValue = true;
+        categoryName = sourceCategory;
+      } else if (globalCategory) {
+        categoryHasValue = true;
+        categoryName = globalCategory;
+      } else categoryHasValue = false;
+      const stableDelivery = categoryHasValue ? { categoryName } : {};
+      if (!hasDeliverySnapshot || existingStatus === 'cancelled') state.deliveries[payload.requestId] = stableDelivery;
+      deliveryJSON = digestDeliveryJson(deliveryOptions.openNative !== false, categoryName, categoryHasValue);
+      if (!deliveryJSON) { this.digestNotice(t('digestCategoryInvalid')); return null; }
+    }
+    if (!isCurrent()) { this.digestNotice('The Reader source changed before saving the Reader highlight. Select the text again.'); return null; }
+    const annotation = await this.plugin.persistHighlight(selected, note, isCurrent);
+    if (!annotation) { this.digestNotice('Could not safely save this excerpt in Reader Highlights. Check its folder and select the text again.'); return null; }
+    if (!isCurrent()) { this.digestNotice('The Reader source changed while saving the highlight. Select the text again.'); return null; }
     if (existingStatus === 'saved' || existingStatus === 'pending' || existingStatus === 'uncertain') {
       let receipt = null;
       try { receipt = this.plugin.localDigestReceipt?.(annotation.id) || null; }
       catch (error) { console.warn('MD Reader: local Digest receipt could not be read', error); }
-      if (receipt?.request === payload.requestId) {
+      if (receipt?.request === payload.requestId && Number.isSafeInteger(receipt.id) && receipt.id > 0) {
         if (!await paintBeforeHandoff()) return null;
+        if (mode === 'quick' && deliveryOptions.openNative === false) {
+          this.digestNotice(t('digestAlreadySaved'));
+          return payload.requestId;
+        }
         return this.openDigestReceipt(receipt) ? payload.requestId : null;
       }
     }
@@ -3619,7 +3727,7 @@ class ReaderView extends ItemView {
     let quickEnvelope = null;
     if (mode === 'quick') {
       try {
-        quickEnvelope = await makeQuickEnvelope(vault, json, payload.requestId, digestLocalStorage());
+        quickEnvelope = await makeQuickEnvelope(vault, json, payload.requestId, digestLocalStorage(), deliveryJSON);
         query = quickEnvelope.query;
       } catch (error) {
         console.warn('MD Reader: quick Digest signing failed', error);
@@ -3629,40 +3737,32 @@ class ReaderView extends ItemView {
     }
     const uri = 'supernote-bridge://digest?' + query + '&payload=' + encodeURIComponent(json);
     if (uri.length > DIGEST_URI_LIMIT) { this.digestNotice('This Digest request is too large to open. Select a shorter passage.'); return null; }
-    if (existingStatus === 'saved') {
-      if (!await paintBeforeHandoff()) return null;
-      try {
-        this.digestNotice('Opening saved Digest.');
-        window.open(uri, '_blank');
-        return payload.requestId;
-      } catch (error) {
-        console.warn('MD Reader: saved Digest could not be reopened in Supernote Bridge', error);
-        this.digestNotice('Could not reopen this saved Digest. Check the native Digest list.');
-        return null;
-      }
-    }
     if (existingStatus === 'uncertain') {
       this.digestNotice('This request may already have been written. Check Supernote Digests; this request will not be sent again.'); return null;
     }
+    if (!isCurrent()) { this.digestNotice('The Reader source changed before Digest handoff. Select the text again.'); return null; }
+    if (!await paintBeforeHandoff()) return null;
     if (typeof this.plugin.associateDigestAnnotation !== 'function' ||
         !this.plugin.associateDigestAnnotation(vault, payload.requestId, annotation.id)) {
       this.digestNotice('Reader could not link this excerpt to its local Digest receipt. Check local storage and try again.');
       return null;
     }
-    state.requests[payload.requestId] = 'pending';
+    if (existingStatus == null || existingStatus === 'cancelled') state.requests[payload.requestId] = 'pending';
     if (!writeDigestState(vault, storage, state)) {
       this.digestNotice('Reader could not save the local Digest request state. Enable local storage and try again.'); return null;
     }
     if (quickEnvelope) {
       const quickPending = readQuickPending(vault, storage);
+      const previousQuickClient = quickPending[payload.requestId];
       quickPending[payload.requestId] = quickEnvelope.credentials.client;
       if (!writeQuickPending(vault, storage, quickPending)) {
-        delete state.requests[payload.requestId]; writeDigestState(vault, storage, state);
+        if (previousQuickClient) quickPending[payload.requestId] = previousQuickClient;
+        else delete quickPending[payload.requestId];
+        writeQuickPending(vault, storage, quickPending);
+        writeDigestState(vault, storage, stateBeforeDelivery);
         this.digestNotice('Reader could not save local Digest permission state. Check local storage and try again.'); return null;
       }
     }
-    if (!isCurrent()) { this.digestNotice('The Reader source changed before Digest handoff. Select the text again.'); return null; }
-    if (!await paintBeforeHandoff()) return null;
     // Keep a request-only route available when native detail remains in front
     // and Obsidian never receives a foreground SAVED callback. Bridge checks
     // its own SAVED ledger before opening; this record is not proof of a save.
@@ -3675,7 +3775,7 @@ class ReaderView extends ItemView {
     try {
       window.open(uri, '_blank');
       const dispatchNotice = mode === 'quick'
-        ? 'Opening native Digest. Use Edit in the entry to add a note.'
+        ? t('digestSaving')
         : 'Review and save in Supernote Bridge. Reader will report success only after Bridge confirms it.';
       this.digestNotice(dispatchNotice);
       return payload.requestId;
@@ -3683,12 +3783,10 @@ class ReaderView extends ItemView {
       const failedLinks = readDigestAnnotationLinks(vault, storage);
       if (previousDispatch) failedLinks.requests[payload.requestId] = previousDispatch;
       else delete failedLinks.requests[payload.requestId];
-      if (existingStatus == null) delete failedLinks.pending[payload.requestId];
+      if (existingStatus == null || existingStatus === 'cancelled') delete failedLinks.pending[payload.requestId];
       writeDigestAnnotationLinks(vault, storage, failedLinks);
-      if (existingStatus == null) {
-        const failedState = readDigestState(vault, storage);
-        delete failedState.requests[payload.requestId];
-        writeDigestState(vault, storage, failedState);
+      if (existingStatus == null || existingStatus === 'cancelled') {
+        writeDigestState(vault, storage, stateBeforeDelivery);
         const failedQuick = readQuickPending(vault, storage);
         delete failedQuick[payload.requestId];
         writeQuickPending(vault, storage, failedQuick);
@@ -4727,7 +4825,25 @@ class ReaderSettingTab extends PluginSettingTab {
       .addButton((button) => button.setButtonText('Open Highlights').onClick(() => this.plugin.openHighlights()));
 
     if (digestIsAndroid()) {
-      new Setting(containerEl).setName(t('nativeDigestSettings')).setDesc(t('digestDefaultsHint'))
+      new Setting(containerEl).setName(t('nativeDigestSettings')).setDesc(t('digestDefaultsHint'));
+      const savedDigestCategory = typeof this.plugin.settings.digestCategoryName === 'string'
+        ? this.plugin.settings.digestCategoryName : '';
+      new Setting(containerEl).setName(t('digestCategoryName')).setDesc(t('digestCategoryDesc'))
+        .addText((tx) => {
+          tx.setPlaceholder('Uncategorized (device default)').setValue(savedDigestCategory);
+          if (tx.inputEl) tx.inputEl.maxLength = DIGEST_CATEGORY_LIMIT;
+          tx.onChange(async (input) => {
+            const value = normalizeDigestCategorySetting(input);
+            if (value === null) {
+              new Notice(t('digestCategoryInvalid'));
+              tx.setValue(typeof this.plugin.settings.digestCategoryName === 'string' ? this.plugin.settings.digestCategoryName : '');
+              return;
+            }
+            this.plugin.settings.digestCategoryName = value;
+            await save();
+          });
+        });
+      new Setting(containerEl).setName(t('configureDigestDefaults')).setDesc(t('digestDefaultsHint'))
         .addButton((button) => button.setButtonText(t('configureDigestDefaults')).onClick(() => {
           try { window.open('supernote-bridge://digest-settings'); }
           catch (error) { new Notice('Supernote Bridge did not open. Install or update it, then retry.'); }
@@ -5958,10 +6074,12 @@ class MdReaderPlugin extends Plugin {
       const linksBefore = readDigestAnnotationLinks(vault, storage);
       const retryingReceiptLink = state.requests[result.requestId] === 'saved' && result.status === 'saved' &&
         Object.values(linksBefore.receipts).some((receipt) => receipt.request === result.requestId && receipt.id === result.id);
-      if (state.requests[result.requestId] !== 'pending' && !retryingReceiptLink) return false;
       const quickPending = readQuickPending(vault, storage);
       let quickCredentials = null;
       const pendingQuickClient = quickPending[result.requestId];
+      const retryingQuickSaved = state.requests[result.requestId] === 'saved' && result.status === 'saved' &&
+        !!pendingQuickClient && result.quick === pendingQuickClient;
+      if (state.requests[result.requestId] !== 'pending' && !retryingReceiptLink && !retryingQuickSaved) return false;
       if (result.quick !== null) {
         if (result.status !== 'saved') return false;
         const pending = { vault, requestId: result.requestId, client: pendingQuickClient };
@@ -5974,6 +6092,7 @@ class MdReaderPlugin extends Plugin {
       // remains pending and Bridge can replay its callback without another insert.
       if (!this.completeDigestAnnotation(vault, result.requestId, result.status, result.id)) return false;
       state.requests[result.requestId] = result.status;
+      if (result.status === 'cancelled') delete state.deliveries[result.requestId];
       if (!writeDigestState(vault, storage, state)) return false;
       // The receipt ledger is authoritative and is written before optional auth
       // bookkeeping. A failed cleanup must not lose a durable Reader receipt.
@@ -5986,8 +6105,10 @@ class MdReaderPlugin extends Plugin {
         delete quickPending[result.requestId];
         writeQuickPending(vault, storage, quickPending);
       }
-      if (result.status === 'saved') new Notice('Supernote Bridge confirmed Digest #' + result.id + '.');
+      if (result.status === 'saved') new Notice(result.id ? 'Supernote Bridge confirmed Digest #' + result.id + '.' : t('digestSaved'));
       else if (result.status === 'uncertain') new Notice('Bridge could not confirm this Digest. Check Supernote Digests; this request will not be sent again.');
+      else if (result.reason === 'category-not-found') new Notice(t('digestCategoryNotFound'));
+      else if (result.reason === 'category-ambiguous') new Notice(t('digestCategoryAmbiguous'));
       else new Notice('Digest capture was cancelled. Select the passage again to retry.');
       return true;
     } catch (error) {

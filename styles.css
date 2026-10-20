@@ -24,6 +24,13 @@
   touch-action: pan-y;
   -webkit-user-select: text;
   user-select: text;
+  --hr-persistent-highlight-bg: #b8b8b8;
+  --hr-persistent-highlight-color: var(--text-normal);
+}
+.theme-dark .hr-viewport,
+.hr-viewport.hr-tint-night {
+  --hr-persistent-highlight-bg: #484848;
+  --hr-persistent-highlight-color: #fff;
 }
 
 /* ===== Тонировка страницы =====
@@ -495,9 +502,9 @@
 }
 .hr-reader-tools > button:focus-visible { outline: 2px solid var(--interactive-accent); outline-offset: 2px; }
 .hr-reader-tools > .hr-reader-appearance { order: 4; }
-.hr-content .hr-persistent-highlight { color: inherit; background: var(--text-highlight-bg, #f4dc69); cursor: pointer; }
+.hr-content .hr-persistent-highlight { color: var(--hr-persistent-highlight-color, inherit); background: var(--hr-persistent-highlight-bg, #b8b8b8); cursor: pointer; }
 .hr-content .hr-persistent-highlight:focus-visible { outline: 2px solid var(--interactive-accent); outline-offset: 1px; }
-.hr-content::highlight(md-reader-persistent) { background: var(--text-highlight-bg, #f4dc69); color: inherit; }
+.hr-content::highlight(md-reader-persistent) { background: var(--hr-persistent-highlight-bg, #b8b8b8); color: var(--hr-persistent-highlight-color, inherit); }
 .hr-highlight-row { padding: 12px 0; border-bottom: 1px solid var(--background-modifier-border); }
 .hr-highlight-quote { font-size: var(--font-text-size); line-height: 1.45; }
 .hr-highlight-meta { margin: 5px 0; color: var(--text-muted); font-size: var(--font-ui-small); overflow-wrap: anywhere; }

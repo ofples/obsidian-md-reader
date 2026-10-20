@@ -72,8 +72,8 @@ const chain = () => new Proxy(function () {}, {
   apply: () => chain(),
 });
 class SettingStub {
-  constructor(containerEl) { this.containerEl = containerEl; containerEl.createDiv('setting-item'); }
-  setName() { return this; }
+  constructor(containerEl) { this.containerEl = containerEl; this.item = containerEl.createDiv('setting-item'); }
+  setName(name) { this.item.setText(String(name)); return this; }
   setDesc() { return this; }
   setHeading() { return this; }
   addSlider(cb) { cb(chain()); return this; }
@@ -301,10 +301,13 @@ ok('оформление: ползунки на месте', ap.contentEl.queryS
 plugin.settings.tint = 'none';
 
 /* ---------- вкладка настроек ---------- */
+obsidian.Platform.isAndroid = true;
 const tab = new T.ReaderSettingTab(app, plugin);
 tab.display();
 ok('настройки: строк хватает', tab.containerEl.querySelectorAll('.setting-item').length > 20,
   tab.containerEl.querySelectorAll('.setting-item').length);
+ok('настройки Android: глобальная Digest category доступна', tab.containerEl.textDump.includes('Default category'));
+obsidian.Platform.isAndroid = false;
 
 /* ---------- самонастройка размера блока под скорость машины ---------- */
 const perf = Object.create(T.MdReaderPlugin.prototype);
