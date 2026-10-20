@@ -762,10 +762,7 @@ const css = readFileSync(join(__dirname, '../styles.css'), 'utf8');
       const pageBefore = view.page;
       mark.dispatchEvent(click);
       const titles = window.lastMenu?.items.map((item) => item.title) || [];
-      const quick = window.lastMenu?.items.find((entry) => entry.title === 'Quick Digest');
       const create = window.lastMenu?.items.find((entry) => entry.title === 'Create Digest');
-      const quickResult = quick ? await quick.action() : null;
-      const quickDispatched = openedUris.at(-1);
       const result = create ? await create.action() : null;
       const dispatched = openedUris.at(-1);
       plugin.localDigestReceipt = () => ({ request: 'f'.repeat(64), id: 42 });
@@ -777,16 +774,16 @@ const css = readFileSync(join(__dirname, '../styles.css'), 'utf8');
       mark.dispatchEvent(savedClick);
       const receipt = window.lastMenu?.items.find((entry) => entry.title === 'Open Digest');
       if (receipt) receipt.action();
+      const savedTitles = window.lastMenu?.items.map((item) => item.title) || [];
       const okay = click.defaultPrevented && view.page === pageBefore && titles.some((title) => title.startsWith('Copy highlight')) &&
-        titles.some((title) => title.startsWith('Remove highlight')) && titles.includes('Quick Digest') && titles.includes('Create Digest') &&
+        titles.some((title) => title.startsWith('Remove highlight')) && !titles.includes('Quick Digest') && titles.includes('Create Digest') &&
         !titles.includes('Digest with note…') && result && dispatched.startsWith('supernote-bridge://digest?') &&
-        quickResult && JSON.parse(new URL(quickDispatched).searchParams.get('delivery')).openNative === false &&
-        JSON.parse(new URL(dispatched).searchParams.get('delivery')).openNative === true &&
-        JSON.parse(new URL(quickDispatched).searchParams.get('payload')).requestId === JSON.parse(new URL(dispatched).searchParams.get('payload')).requestId &&
+        JSON.parse(new URL(dispatched).searchParams.get('delivery')).openNative === false &&
         JSON.parse(new URL(dispatched).searchParams.get('payload')).text === 'Paragraph 12:' && !!receipt &&
+        !savedTitles.includes('Quick Digest') && !savedTitles.includes('Create Digest') &&
         openedUris.at(-1) === 'supernote-bridge://digest-receipt?request=' + 'f'.repeat(64) + '&id=42';
       return okay || { clickPrevented: click.defaultPrevented, beforePage: pageBefore, page: view.page, titles,
-        result, dispatched, receipt: !!receipt, opened: openedUris.at(-1), active: view._digestSelection?.text, activeGen: view._digestSelection?.renderGen };
+        savedTitles, result, dispatched, receipt: !!receipt, opened: openedUris.at(-1), active: view._digestSelection?.text, activeGen: view._digestSelection?.renderGen };
     });
     await check('context-menu and keyboard activation open saved-highlight actions', () => {
       const mark = view.content.querySelector('.hr-persistent-highlight');

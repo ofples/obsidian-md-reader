@@ -576,7 +576,7 @@ const STRINGS = {
     quoteFolderDesc: 'One Markdown note per book. Path inside the vault; empty uses Books/Quotes.',
     nativeDigestSettings: 'Native Digests',
     configureDigestDefaults: 'Digest preferences',
-    digestDefaultsHint: 'Create Digest opens the saved entry. Quick Digest saves it silently so you can keep reading.',
+    digestDefaultsHint: 'Create Digest saves the entry and returns to Reader. Use Open Digest from its saved Highlight to view or edit it.',
     digestCategoryName: 'Default category',
     digestCategoryDesc: 'Exact native category name. Blank uses the device default, usually Uncategorized. Maximum 128 characters.',
     digestCategoryInvalid: 'Digest category must be at most 128 characters and contain no control characters.',
@@ -3174,10 +3174,8 @@ class ReaderView extends ItemView {
 
   addSelectionMenuItems(menu, quote, includeQuote) {
     if (digestIsAndroid()) {
-      menu.addItem((i) => i.setTitle('Quick Digest').setIcon('bookmark-plus')
-        .onClick(() => this.saveSelectedDigest(quote, 'quick', { openNative: false })));
       menu.addItem((i) => i.setTitle('Create Digest').setIcon('bookmark-plus')
-        .onClick(() => this.saveSelectedDigest(quote, 'quick', { openNative: true })));
+        .onClick(() => this.saveSelectedDigest(quote, 'quick', { openNative: false })));
     }
     menu.addItem((i) => i.setTitle('Highlight').setIcon('highlighter').onClick(() => this.toggleSelectedHighlight(quote)));
     menu.addItem((i) => i.setTitle('Copy').setIcon('copy').onClick(() => this.copySelectedText(quote)));
@@ -3439,10 +3437,8 @@ class ReaderView extends ItemView {
         .onClick(() => this.removePersistentHighlight(record)));
       const receipt = this.plugin.localDigestReceipt?.(record.id);
       if (digestIsAndroid()) {
-        menu.addItem((item) => item.setTitle('Quick Digest' + (valid.length > 1 ? ' · ' + label : '')).setIcon('bookmark-plus')
+        if (receipt?.id == null) menu.addItem((item) => item.setTitle('Create Digest' + (valid.length > 1 ? ' · ' + label : '')).setIcon('bookmark-plus')
           .onClick(() => this.digestPersistentHighlight(entry, 'quick', { openNative: false })));
-        menu.addItem((item) => item.setTitle('Create Digest' + (valid.length > 1 ? ' · ' + label : '')).setIcon('bookmark-plus')
-          .onClick(() => this.digestPersistentHighlight(entry, 'quick', { openNative: true })));
       }
       if (receipt?.id != null && digestIsAndroid()) {
         menu.addItem((item) => item.setTitle('Open Digest').setIcon('external-link')

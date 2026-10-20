@@ -1,7 +1,7 @@
 {
   "id": "md-reader",
   "name": "MD Reader",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "minAppVersion": "1.4.0",
   "description": "Read paginated Markdown, import books, save persistent Reader highlights, and review selected text as Supernote Digests on Android.",
   "author": "mrrepac",
